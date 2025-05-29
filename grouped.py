@@ -105,6 +105,93 @@ combined_payment_fields = {
 }
 
 # --- Среднемесячные платежи ---
+def evaluate_row_conditions(row, preply_df):
+    comments = []
+    marker = "Идет в расчет"
+
+    contract_id = row.get("УИД_Договора")
+    print(f"Обрабатываем договор: {contract_id}")
+
+    # Проверка: разница дней >= 90
+    diff_days_val = row.get("Разница дней")
+    try:
+        diff_days = int(diff_days_val)
+    except (TypeError, ValueError):
+        diff_days = 0
+
+    if diff_days_val is None or pd.isna(diff_days_val) or diff_days >= 90:
+        comments.append("Более 90 дней с даты заявки")
+        marker = "Не идет в расчет"
+
+    # Проверка: дубликат
+    if row.get("Маркер дубликатов") == "Дубликат":
+        comments.append("Дубликат")
+        marker = "Не идет в расчет"
+
+    # Проверка условий по НБКИ (если БКИ == "НБКИ")
+    if row.get("БКИ") == "НБКИ":
+        preply_row = preply_df[preply_df["УИД_Договора"] == contract_id]
+
+        if preply_row.empty:
+            comments.append("Отсутствуют данные по договору")
+            marker = "Не идет в расчет"
+        else:
+            preply_row = preply_row.iloc[0]
+
+            date_request = row.get("Дата заявки")
+            lastupdateDt = preply_row.get("Дата обновления информации по займу <lastUpdatedDt>")
+            closedDt = preply_row.get("Плановая дата закрытия <closedDt>")
+            openedDt = preply_row.get("Дата открытия <openedDt>")
+            acctType = preply_row.get("Тип займа <acctType>")
+            principal_outstanding = preply_row.get("Остаток суммы по договору <principalOutstanding>")
+            account_rating = preply_row.get("Статус договора <accountRating>")
+            ownerIndic = preply_row.get("Отношение к кредиту <ownerIndic>")
+
+            print(f"Дата заявки: {date_request}, lastupdateDt: {lastupdateDt}, closedDt: {closedDt}")
+
+            necessary_fields = [closedDt, openedDt, acctType, account_rating, ownerIndic]
+            if any(field is None or pd.isna(field) for field in necessary_fields):
+                comments.append("Отсутствуют данные в полях")
+                marker = "Не идет в расчет"
+
+            try:
+                if pd.notna(lastupdateDt) and pd.notna(date_request):
+                    delta = (date_request - lastupdateDt).days
+                    if delta > 31:
+                        comments.append("Последнее обновление свыше 31 дня")
+                        marker = "Не идет в расчет"
+            except Exception as e:
+                comments.append(f"Ошибка при вычислении разницы дат lastupdateDt: {e}")
+                marker = "Не идет в расчет"
+
+            try:
+                if pd.notna(closedDt) and pd.notna(date_request):
+                    delta = (closedDt - date_request).days
+                    if delta < 31:
+                        comments.append("До плановой даты закрытия менее 31 дня")
+                        marker = "Не идет в расчет"
+            except Exception as e:
+                comments.append(f"Ошибка при вычислении разницы дат closedDt: {e}")
+                marker = "Не идет в расчет"
+
+            try:
+                if principal_outstanding is None or float(str(principal_outstanding).replace(",", ".")) <= 0:
+                    comments.append("Остаток задолженности равен нулю или отсутствует")
+                    marker = "Не идет в расчет"
+            except Exception as e:
+                comments.append(f"Некорректное значение остатка задолженности: {e}")
+                marker = "Не идет в расчет"
+
+            try:
+                if int(account_rating) == 13:
+                    comments.append("Статус кредитного договора закрыт")
+                    marker = "Не идет в расчет"
+            except Exception:
+                pass  # игнорируем ошибки преобразования
+
+    return pd.Series(["; ".join(comments), marker])
+
+
 def parse_monthly_payment(xml_path, date_request, preply_df):
     contract_mkk = os.path.splitext(os.path.basename(xml_path))[0][:7]
     tree = ET.parse(xml_path)
@@ -124,11 +211,11 @@ def parse_monthly_payment(xml_path, date_request, preply_df):
             continue
 
         for dogovor in bki.findall("Договор"):
-            uid = dogovor.attrib.get("УИД")
+            uid = dogovor.attrib.get("УИД_Договора")
             payment = dogovor.find("СреднемесячныйПлатеж")
             if payment is None:
                 continue
-            
+
             date_calc = payment.attrib.get("ДатаРасчета")
             amount = payment.text.strip() if payment.text else None
             currency = payment.attrib.get("Валюта")
@@ -147,10 +234,9 @@ def parse_monthly_payment(xml_path, date_request, preply_df):
 
     for col in ["ДатаРасчета", "Дата заявки"]:
         df[col] = pd.to_datetime(df[col], errors="coerce")
-        
+
     df["Разница дней"] = (df["Дата заявки"] - df["ДатаРасчета"]).dt.days
     df["Сумма"] = pd.to_numeric(df["Сумма"].astype(str).str.replace(",", "."), errors="coerce")
-    
 
     grouped = df.groupby("УИД_Договора")
     result = []
@@ -171,123 +257,17 @@ def parse_monthly_payment(xml_path, date_request, preply_df):
 
     df_final = pd.concat(result)
 
-    def check_nbki_conditions(row, preply_df):
+    # Применяем комментарии и маркеры с отладкой
+    df_final[["Комментарии", "Маркер учета"]] = df_final.apply(
+        lambda row: evaluate_row_conditions(row, preply_df), axis=1
+    )
 
+    df_selected = df_final[df_final["Маркер учета"] == "Идет в расчет"]
+    df_excluded = df_final[df_final["Маркер учета"] == "Не идет в расчет"]
 
-        if row.get("ParentTag", "") != "preply":
-            return pd.Series(["", "Идет в расчет"])
+    print(f"Всего строк: {len(df_final)}, Идет в расчет: {len(df_selected)}, Не идет в расчет: {len(df_excluded)}")
 
-        contract_id = str(row.get("УИД_Договора")).strip()
-        preply_df["УИД_Договора"] = preply_df["УИД_Договора"].astype(str).str.strip()
-
-        if preply_row.empty:
-            print(f"Не найдено совпадение в preply_df для УИД {contract_id}")
-
-        preply_row = preply_row.iloc[0]
-
-        date_request = row["Дата заявки"]
-        lastupdateDt = pd.to_datetime(preply_row.get("Дата обновления информации по займу <lastUpdatedDt>"), errors="coerce")
-        closedDt = pd.to_datetime(preply_row.get("Плановая дата закрытия <closedDt>"))
-        openedDt = pd.to_datetime(preply_row.get("Дата открытия <openedDt>"))
-        acctType = preply_row.get("Тип займа <acctType>")
-        principal_outstanding = preply_row.get("Остаток суммы по договору <principalOutstanding>")
-        account_rating = preply_row.get("Статус договора <accountRating>")
-        ownerIndic = preply_row.get("Отношение к кредиту <ownerIndic>")
-
-        # Отсутствие данных в полях
-        necessary_fields = [closedDt, openedDt, acctType, account_rating, ownerIndic]
-        for field in necessary_fields:
-            if pd.isna(field):
-                return pd.Series(["Отсутствуют данные в полях", "Не идет в расчет"])
-
-        # Последнее обновление > 31 день
-        if pd.notna(lastupdateDt) and pd.notna(date_request):
-            delta1 = (date_request - lastupdateDt).days
-            if delta1 > 31:
-                return pd.Series(["Последнее обновление свыше 31 дня", "Не идет в расчет"])
-        else:
-            return pd.Series(["Отсутствуют данные в полях", "Не идет в расчет"])
-    
-        # До планового закрытия менее 31 дня
-        if pd.notna(closedDt) and pd.notna(date_request):
-            delta2 = (closedDt - date_request).days
-            if delta2 > 31:
-                return pd.Series(["До плановой даты закрытия прошло более 31 дня", "Не идет в расчет"])
-        else:
-            return pd.Series(["Отсутствуют данные в полях", "Не идет в расчет"])
-
-        # Договор выплачен
-        try:
-            print(f"type: {type(preply_row['Остаток суммы по договору <principalOutstanding>'])}")
-            if principal_outstanding is None or float(principal_outstanding) <= 0:
-                return pd.Series(["Остаток задолженности равен нулю или отсутствует", "Не идет в расчет"])
-        except Exception:
-            return pd.Series(["Некорректное значение principalOutstanding", "Не идет в расчет"])
-
-        # Договор закрыт
-        if str(account_rating).strip() == "13":
-            return pd.Series(["Статус кредитного договора закрыт", "Не идет в расчет"])
-
-        print("NBKI CHECK:")
-        print(f"  УИД: {contract_id}")
-        print(f"  lastupdateDt: {lastupdateDt}")
-        print(f"  closedDt: {closedDt}")
-        print(f"  openedDt: {openedDt}")
-        print(f"  acctType: {acctType}")
-        print(f"  account_rating: {account_rating}")
-        print(f"  ownerIndic: {ownerIndic}")
-
-        return pd.Series(["", "Идет в расчет"])
-        
-
-    def comment_and_marker(row, nbki_comment, nbki_marker):
-        comments = []
-        marker = "Идет в расчет"
-
-        # Добавим комментарий от NBKI, если есть
-        if nbki_comment:
-            comments.append(nbki_comment)
-        if nbki_marker == "Не идет в расчет":
-            marker = "Не идет в расчет"
-
-        # Проверка дубликатов
-        if row.get("Маркер дубликатов") == "Дубликат":
-            comments.append("Дубликат")
-            marker = "Не идет в расчет"
-
-        # Проверка по дате
-        diff_days = row.get("Разница дней", 0)
-        try:
-            diff_days = int(diff_days)
-        except Exception:
-            diff_days = 0
-
-        if pd.isna(row.get("Разница дней")) or diff_days >= 90:
-            comment_final = "Более 90 дней с даты заявки"
-            marker = "Не идет в расчет"
-        else:
-            comment_final = "; ".join(comments) if comments else ""
-
-        return pd.Series([comment_final, marker])
-        
-    def combined_conditions(row, preply_df):
-    # код как я показал выше
-        nbki_comment, nbki_marker = check_nbki_conditions(row, preply_df)
-        return comment_and_marker(row, nbki_comment, nbki_marker)
-
-    # Применяем к df_final
-    df_final[["Комментарии", "Маркер учета"]] = df_final.apply(lambda row: combined_conditions(row, preply_df), axis=1)
-
-
-
-    df["Сумма"] = pd.to_numeric(df["Сумма"].astype(str).str.replace(",", "."), errors="coerce")
-    df["ДатаРасчета"] = pd.to_datetime(df["ДатаРасчета"], format="%Y-%m-%d", errors="coerce")
-    df["Дата заявки"] = pd.to_datetime(df["Дата заявки"], format="%Y-%m-%d", errors="coerce")
-
-    # Отобранные — только те, которые идут в расчет
-    filtered = df_final[df_final["Маркер учета"] == "Идет в расчет"]
-
-    return df_final, filtered
+    return df_final, df_selected
 
 # --- Кредитный отчёт ---
 def parse_credit_report(xml_path):
@@ -424,10 +404,4 @@ def main():
     except Exception as e:
         messagebox.showerror("Ошибка", f"Произошла ошибка:\n{e}")
 if __name__ == "__main__":
-    df = pd.DataFrame({
-        "Дата открытия <openedDt>": ["01.01.2020", "15.02.2021"],
-        "Кредитный лимит <creditLimit>": ["10000,50", "20000,00"]
-    })
-    df = convert_types_credit_report(df)
-    print(df)
     main()
