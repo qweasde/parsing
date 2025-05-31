@@ -28,7 +28,6 @@ def convert_types_credit_report(df):
         "Дата возникновения срочной задолженности <startDt>"
     ]
 
-        # Список полей с числами (пример по combined_fields)
     numeric_fields = [
         "Кредитный лимит <creditLimit>",
         "Сумма задолженности <amtOutstanding>",
@@ -104,7 +103,6 @@ combined_payment_fields = {
     "principalTotalAmt": "Общая сумма платежей по основному долгу <principalTotalAmt>"
 }
 
-# --- Среднемесячные платежи ---
 def evaluate_row_conditions(row, preply_df):
     comments = []
     marker = "Идет в расчет"
@@ -189,7 +187,7 @@ def evaluate_row_conditions(row, preply_df):
             except Exception:
                 pass  # игнорируем ошибки преобразования
 
-    return pd.Series(["; ".join(comments), marker])
+    return pd.Series([", ".join(comments) if comments else "", marker])
 
 
 def parse_monthly_payment(xml_path, date_request, preply_df):
@@ -256,16 +254,16 @@ def parse_monthly_payment(xml_path, date_request, preply_df):
         result.append(group)
 
     df_final = pd.concat(result)
-
+    print(f"Количество строк в df_final: {len(df_final)}")
+    print(f"Пример первой строки: {df_final.iloc[0]}")
     # Применяем комментарии и маркеры с отладкой
-    df_final[["Комментарии", "Маркер учета"]] = df_final.apply(
-        lambda row: evaluate_row_conditions(row, preply_df), axis=1
-    )
+    if not df_final.empty:
+        df_final[["Комментарии", "Маркер учета"]] = df_final.apply(lambda row: evaluate_row_conditions(row, preply_df), axis=1)
+    else:
+        print("DataFrame df_final пустой.")
 
     df_selected = df_final[df_final["Маркер учета"] == "Идет в расчет"]
     df_excluded = df_final[df_final["Маркер учета"] == "Не идет в расчет"]
-
-    print(f"Всего строк: {len(df_final)}, Идет в расчет: {len(df_selected)}, Не идет в расчет: {len(df_excluded)}")
 
     return df_final, df_selected
 
