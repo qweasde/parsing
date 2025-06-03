@@ -3,6 +3,7 @@ import xml.etree.ElementTree as ET
 from lxml import etree
 from tkinter import Tk, filedialog, simpledialog, messagebox
 import os
+from collections import defaultdict
 from datetime import datetime
 
 # --- Словари ---
@@ -267,7 +268,53 @@ def parse_monthly_payment(xml_path, date_request, preply_df):
 
     return df_final, df_selected
 
-# --- Кредитный отчёт ---
+def mark_duplicates_preply(df):
+    df = df.copy()
+    df["Маркер дубликатов"] = "Оригинал"
+
+    group_cols = [
+        "UUID договора",
+        "Сумма платежа <paymtAmt>",
+        "Дата платежа <paymtDate>"
+    ]
+
+    df_preply = df[df["Родительский тег"] == "preply"]
+
+    for _, group in df_preply.groupby(group_cols):
+        if len(group) > 1:
+            idx_max = group["Дата обновления информации по платежу <lastUpdatedDt>"].idxmax()
+            idx_all = group.index.tolist()
+            idx_all.remove(idx_max)
+            df.loc[idx_all, "Маркер дубликатов"] = "Дубликат"
+    duplicates = df[df["Родительский тег"] == "preply"].duplicated(subset=["UUID договора", "Сумма платежа <paymtAmt>", "Дата платежа <paymtDate>"], keep=False)
+    print(df[duplicates])
+    return df
+
+def mark_duplicates_preply2(df):
+    if 'Маркер дубликатов' not in df.columns:
+        df['Маркер дубликатов'] = 'Оригинал'
+    else:
+        df['Маркер дубликатов'] = 'Оригинал'
+
+    mask = (df['Родительский тег'] == 'preply2') & (df['Тип'] == 'Платёж')
+    df_payments = df[mask]
+
+    group_cols = ['UUID договора', 'Сумма платежа <paymtAmt>', 'Дата платежа <paymtDate>']
+
+    for key, group in df_payments.groupby(group_cols):
+        # Проверяем, одинаковы ли totalAmt в группе
+        if group['Общая сумма платежа <totalAmt>'].nunique() == 1:
+            # Если да, выделяем только самый свежий по дате обновления как оригинал
+            idx_latest = group['Дата обновления информации по платежу <lastUpdatedDt>'].idxmax()
+            df.loc[group.index, 'Маркер дубликатов'] = 'Дубликат'
+            df.loc[idx_latest, 'Маркер дубликатов'] = 'Оригинал'
+        else:
+            # Если разные totalAmt — все оригиналы
+            df.loc[group.index, 'Маркер дубликатов'] = 'Оригинал'
+
+    return df
+
+# Функция парсинга кредитного отчета
 def parse_credit_report(xml_path):
     tree = etree.parse(xml_path)
     root = tree.getroot()
@@ -293,14 +340,12 @@ def parse_credit_report(xml_path):
                         val = acc.findtext("closedDt")
                     contract[label] = val
 
-                # Расшифровка кодов
                 if node_type == "AccountReplyRUTDF":
                     code = contract.get("Тип займа <acctType>")
                     contract["Тип займа <acctTypeText>"] = acct_type_dict.get(code)
                     owner_code = contract.get("Отношение к кредиту <ownerIndic>")
                     contract["Отношение к кредиту <ownerIndicText>"] = owner_indic_dict.get(owner_code)
 
-                    # Вложенные блоки
                     paymtCondition_block = acc.find("paymtCondition")
                     if paymtCondition_block is not None:
                         contract["Дата ближайшего следующего платежа по основному долгу <principalTermsAmtDt>"] = paymtCondition_block.findtext("principalTermsAmtDt")
@@ -335,7 +380,8 @@ def parse_credit_report(xml_path):
                         "Тип": "Платёж",
                         "Тип договора": node_type,
                         "Номер договора": serial,
-                        "UUID договора": uuid
+                        "UUID договора": uuid,
+                        "Маркер дубликатов": ""
                     }
                     for tag, label in combined_payment_fields.items():
                         row[label] = p.findtext(tag)
@@ -343,19 +389,31 @@ def parse_credit_report(xml_path):
                     rows.append(row)
 
                 if payments:
-                    total = sum(
-                        float(str(p.get("Сумма платежа <paymtAmt>", "0")).replace(",", ".")) for p in payments if p.get("Сумма платежа <paymtAmt>")
-                    )
-                    rows.append({
-                        "Родительский тег": parent_tag,
-                        "Тип": "Итого",
-                        "Тип договора": node_type,
-                        "Сумма платежа <paymtAmt>": total,
-                        "Номер договора": serial,
-                        "UUID договора": uuid
-                    })
+                        total = sum(
+                            float(str(p.get("Сумма платежа <paymtAmt>")).replace(",", "."))
+                            for p in payments if p.get("Сумма платежа <paymtAmt>")
+                        )
+                        rows.append({
+                            "Родительский тег": parent_tag,
+                            "Тип": "Итого",
+                            "Тип договора": node_type,
+                            "Сумма платежа <paymtAmt>": total,
+                            "Номер договора": serial,
+                            "UUID договора": uuid
+                        })
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+
+    payments_df = df[df["Тип"] == "Платёж"].copy()
+
+    if any(payments_df["Родительский тег"].str.contains("preply2")):
+        payments_df = mark_duplicates_preply2(payments_df)
+    else:
+        payments_df = mark_duplicates_preply(payments_df)
+
+    df.loc[payments_df.index, "Маркер дубликатов"] = payments_df["Маркер дубликатов"]
+
+    return df
 
 # Окошки
 def main():
