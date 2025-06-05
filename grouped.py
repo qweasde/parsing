@@ -15,6 +15,7 @@ def convert_types_credit_report(df):
     date_fields = [
         "Дата открытия <openedDt>",
         "Дата обновления информации по займу <lastUpdatedDt>",
+        "Дата обновления информации по платежу <lastUpdatedDt>",
         "Дата последнего платежа <lastPaymtDt>",
         "Плановая дата закрытия <closedDt>",
         "Плановая дата закрытия RUTDF <closeDt>",
@@ -26,7 +27,8 @@ def convert_types_credit_report(df):
         "Дата возникновения обязательства субъекта <commitDate>",
         "Дата расчета <amtDate>",
         "Дата расчета <calcDate>",
-        "Дата возникновения срочной задолженности <startDt>"
+        "Дата возникновения срочной задолженности <startDt>",
+        "Дата платежа <paymtDate>"
     ]
 
     numeric_fields = [
@@ -265,29 +267,39 @@ def parse_monthly_payment(xml_path, date_request, preply_df):
 
     # Отобранные — только те, которые идут в расчет
     df_selected = df_final[df_final["Маркер учета"] == "Идет в расчет"]
+    
+    # Строка Итого для отобранных
+    total_sum = df_selected["Сумма"].sum()
+    total_row = pd.Series({col: "" for col in df_selected.columns}, name="Итого")
+    total_row["Сумма"] = total_sum
+    df_selected_with_total = pd.concat([df_selected, pd.DataFrame([total_row])])
 
-    return df_final, df_selected
+    return df_final, df_selected_with_total
 
 def mark_duplicates_preply(df):
     df = df.copy()
     df["Маркер дубликатов"] = "Оригинал"
+
+    df["Дата обновления информации по платежу <lastUpdatedDt>"] = pd.to_datetime(df["Дата обновления информации по платежу <lastUpdatedDt>"], errors='coerce')
+    df["Дата платежа <paymtDate>"] = pd.to_datetime(df["Дата платежа <paymtDate>"], errors='coerce')
+    df["Родительский тег"] = df["Родительский тег"].str.strip()
+    df["Тип"] = df["Тип"].str.strip()
+    df["Сумма платежа <paymtAmt>"] = pd.to_numeric(df["Сумма платежа <paymtAmt>"], errors='coerce')
+
+    df_preply = df[(df["Родительский тег"] == "preply") & (df["Тип"] == "Платёж")]
 
     group_cols = [
         "UUID договора",
         "Сумма платежа <paymtAmt>",
         "Дата платежа <paymtDate>"
     ]
-
-    df_preply = df[df["Родительский тег"] == "preply"]
-
+    print("Группы с более чем 1 элементом:")
     for _, group in df_preply.groupby(group_cols):
         if len(group) > 1:
             idx_max = group["Дата обновления информации по платежу <lastUpdatedDt>"].idxmax()
-            idx_all = group.index.tolist()
-            idx_all.remove(idx_max)
+            idx_all = group.index.difference([idx_max])
             df.loc[idx_all, "Маркер дубликатов"] = "Дубликат"
-    duplicates = df[df["Родительский тег"] == "preply"].duplicated(subset=["UUID договора", "Сумма платежа <paymtAmt>", "Дата платежа <paymtDate>"], keep=False)
-    print(df[duplicates])
+
     return df
 
 def mark_duplicates_preply2(df):
