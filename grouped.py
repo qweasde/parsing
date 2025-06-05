@@ -272,60 +272,7 @@ def parse_monthly_payment(xml_path, date_request, preply_df):
     total_row = pd.Series({col: "" for col in df_selected.columns}, name="Итого")
     total_row["Сумма"] = total_sum
     df_selected_with_total = pd.concat([df_selected, pd.DataFrame([total_row])])
-
     return df_final, df_selected_with_total
-
-def mark_duplicates_preply(df):
-    df['Дата обновления информации по платежу <lastUpdatedDt>'] = pd.to_datetime(
-        df['Дата обновления информации по платежу <lastUpdatedDt>'], errors='coerce'
-    )
-
-    df['Маркер дубликатов'] = None
-
-    # Только строки с типом "Платёж"
-    payment_rows = df[df['Тип'] == 'Платёж'].copy()
-
-    # Группировка по UUID + сумма + дата платежа
-    grouped = payment_rows.groupby(
-        ['UUID договора', 'Сумма платежа <paymtAmt>', 'Дата платежа <paymtDate>']
-    )
-
-    # Индексы строк с максимальной датой обновления — они будут "Оригинал"
-    idx_keep = grouped['Дата обновления информации по платежу <lastUpdatedDt>'].idxmax()
-
-    # Все индексы этих платежей
-    all_idx = payment_rows.index
-    idx_drop = all_idx.difference(idx_keep)
-
-    # Назначение маркеров
-    df.loc[idx_keep, 'Маркер дубликатов'] = 'Оригинал'
-    df.loc[idx_drop, 'Маркер дубликатов'] = 'Дубликат'
-
-    return df
-
-def mark_duplicates_preply2(df):
-    if 'Маркер дубликатов' not in df.columns:
-        df['Маркер дубликатов'] = 'Оригинал'
-    else:
-        df['Маркер дубликатов'] = 'Оригинал'
-
-    mask = (df['Родительский тег'] == 'preply2') & (df['Тип'] == 'Платёж')
-    df_payments = df[mask]
-
-    group_cols = ['UUID договора', 'Сумма платежа <paymtAmt>', 'Дата платежа <paymtDate>']
-
-    for key, group in df_payments.groupby(group_cols):
-        # Проверяем, одинаковы ли totalAmt в группе
-        if group['Общая сумма платежа <totalAmt>'].nunique() == 1:
-            # Если да, выделяем только самый свежий по дате обновления как оригинал
-            idx_latest = group['Дата обновления информации по платежу <lastUpdatedDt>'].idxmax()
-            df.loc[group.index, 'Маркер дубликатов'] = 'Дубликат'
-            df.loc[idx_latest, 'Маркер дубликатов'] = 'Оригинал'
-        else:
-            # Если разные totalAmt — все оригиналы
-            df.loc[group.index, 'Маркер дубликатов'] = 'Оригинал'
-
-    return df
 
 # Функция парсинга кредитного отчета
 def parse_credit_report(xml_path):
@@ -425,6 +372,46 @@ def parse_credit_report(xml_path):
         payments_df = mark_duplicates_preply(payments_df)
 
     df.loc[payments_df.index, "Маркер дубликатов"] = payments_df["Маркер дубликатов"]
+
+    return df
+
+def mark_duplicates_preply(df):
+    df['Дата платежа <paymtDate>'] = pd.to_datetime(df['Дата платежа <paymtDate>'])
+    df['Дата обновления информации по платежу <lastUpdatedDt>'] = pd.to_datetime(df['Дата обновления информации по платежу <lastUpdatedDt>'])
+    df['Сумма платежа <paymtAmt>'] = pd.to_numeric(df['Сумма платежа <paymtAmt>'])
+
+    grouped = df.groupby(['UUID договора', 'Сумма платежа <paymtAmt>', 'Дата платежа <paymtDate>'])
+
+    def label_group(group):
+        group = group.sort_values('Дата обновления информации по платежу <lastUpdatedDt>', ascending=False).copy()
+        group['Маркер дубликатов'] = 'Дубликат'
+        group.iloc[0, group.columns.get_loc('Маркер дубликатов')] = 'Оригинал'
+        return group
+
+    return grouped.apply(label_group).reset_index(drop=True)
+
+
+def mark_duplicates_preply2(df):
+    if 'Маркер дубликатов' not in df.columns:
+        df['Маркер дубликатов'] = 'Оригинал'
+    else:
+        df['Маркер дубликатов'] = 'Оригинал'
+
+    mask = (df['Родительский тег'] == 'preply2') & (df['Тип'] == 'Платёж')
+    df_payments = df[mask]
+
+    group_cols = ['UUID договора', 'Сумма платежа <paymtAmt>', 'Дата платежа <paymtDate>']
+
+    for key, group in df_payments.groupby(group_cols):
+        # Проверяем, одинаковы ли totalAmt в группе
+        if group['Общая сумма платежа <totalAmt>'].nunique() == 1:
+            # Если да, выделяем только самый свежий по дате обновления как оригинал
+            idx_latest = group['Дата обновления информации по платежу <lastUpdatedDt>'].idxmax()
+            df.loc[group.index, 'Маркер дубликатов'] = 'Дубликат'
+            df.loc[idx_latest, 'Маркер дубликатов'] = 'Оригинал'
+        else:
+            # Если разные totalAmt — все оригиналы
+            df.loc[group.index, 'Маркер дубликатов'] = 'Оригинал'
 
     return df
 
