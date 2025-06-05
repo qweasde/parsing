@@ -1,7 +1,6 @@
 import pandas as pd
 import xml.etree.ElementTree as ET
 from lxml import etree
-from tkinter import Tk, filedialog, simpledialog, messagebox
 import os
 from collections import defaultdict
 from datetime import datetime
@@ -277,28 +276,30 @@ def parse_monthly_payment(xml_path, date_request, preply_df):
     return df_final, df_selected_with_total
 
 def mark_duplicates_preply(df):
-    df = df.copy()
-    df["Маркер дубликатов"] = "Оригинал"
+    df['Дата обновления информации по платежу <lastUpdatedDt>'] = pd.to_datetime(
+        df['Дата обновления информации по платежу <lastUpdatedDt>'], errors='coerce'
+    )
 
-    df["Дата обновления информации по платежу <lastUpdatedDt>"] = pd.to_datetime(df["Дата обновления информации по платежу <lastUpdatedDt>"], errors='coerce')
-    df["Дата платежа <paymtDate>"] = pd.to_datetime(df["Дата платежа <paymtDate>"], errors='coerce')
-    df["Родительский тег"] = df["Родительский тег"].str.strip()
-    df["Тип"] = df["Тип"].str.strip()
-    df["Сумма платежа <paymtAmt>"] = pd.to_numeric(df["Сумма платежа <paymtAmt>"], errors='coerce')
+    df['Маркер дубликатов'] = None
 
-    df_preply = df[(df["Родительский тег"] == "preply") & (df["Тип"] == "Платёж")]
+    # Только строки с типом "Платёж"
+    payment_rows = df[df['Тип'] == 'Платёж'].copy()
 
-    group_cols = [
-        "UUID договора",
-        "Сумма платежа <paymtAmt>",
-        "Дата платежа <paymtDate>"
-    ]
-    print("Группы с более чем 1 элементом:")
-    for _, group in df_preply.groupby(group_cols):
-        if len(group) > 1:
-            idx_max = group["Дата обновления информации по платежу <lastUpdatedDt>"].idxmax()
-            idx_all = group.index.difference([idx_max])
-            df.loc[idx_all, "Маркер дубликатов"] = "Дубликат"
+    # Группировка по UUID + сумма + дата платежа
+    grouped = payment_rows.groupby(
+        ['UUID договора', 'Сумма платежа <paymtAmt>', 'Дата платежа <paymtDate>']
+    )
+
+    # Индексы строк с максимальной датой обновления — они будут "Оригинал"
+    idx_keep = grouped['Дата обновления информации по платежу <lastUpdatedDt>'].idxmax()
+
+    # Все индексы этих платежей
+    all_idx = payment_rows.index
+    idx_drop = all_idx.difference(idx_keep)
+
+    # Назначение маркеров
+    df.loc[idx_keep, 'Маркер дубликатов'] = 'Оригинал'
+    df.loc[idx_drop, 'Маркер дубликатов'] = 'Дубликат'
 
     return df
 
@@ -427,36 +428,39 @@ def parse_credit_report(xml_path):
 
     return df
 
+def get_unique_filename(path):
+    base, ext = os.path.splitext(path)
+    counter = 1
+    new_path = path
+
+    while os.path.exists(new_path):
+        new_path = f"{base} ({counter}){ext}"
+        counter += 1
+
+    return new_path
+
 # Окошки
 def main():
-    root = Tk()
-    root.withdraw()
-    date_request_str = simpledialog.askstring("Дата заявки", "Введите дату заявки (ДД.ММ.ГГГГ):")
-    if not date_request_str:
-        messagebox.showerror("Ошибка", "Дата заявки не указана.")
-        return
-
+    # Жестко задаём дату заявки
+    date_request_str = "02.01.2025"
     try:
         date_request = pd.to_datetime(date_request_str, format="%d.%m.%Y", errors="raise")
-    except Exception:
-        messagebox.showerror("Ошибка", "Неверный формат даты. Используйте ДД.ММ.ГГГГ.")
+    except Exception as e:
+        print(f"Ошибка преобразования даты: {e}")
         return
 
-    messagebox.showinfo("Выбор файла", "Сначала выберите XML файл со среднемесячными платежами")
-    ssp_path = filedialog.askopenfilename(filetypes=[("XML files", "*.xml")])
-    if not ssp_path:
-        return
-
-    messagebox.showinfo("Выбор файла", "Теперь выберите XML файл с кредитным отчётом")
-    ko_path = filedialog.askopenfilename(filetypes=[("XML files", "*.xml")])
-    if not ko_path:
-        return
+    # Жестко задаём пути к файлам
+    ssp_path = "C:/Users/islam/Desktop/Договоры/5608421 ССП.xml"
+    ko_path = "C:/Users/islam/Desktop/Договоры/5484455 КО.xml"
+    output_path = "C:/Users/islam/Desktop/Договоры/result.xlsx"
+    safe_path = get_unique_filename(output_path)
 
     try:
         # Парсим кредитный отчёт
         credit_df = parse_credit_report(ko_path)
+        credit_df = parse_credit_report(ko_path)
 
-        # 🔧 Приведение типов
+        # Приведение типов
         credit_df = convert_types_credit_report(credit_df)
 
         # Отбираем только договоры
@@ -465,23 +469,18 @@ def main():
         # Парсим среднемесячные платежи
         df_full, df_selected = parse_monthly_payment(ssp_path, date_request, preply_df)
 
-        # Сохраняем
-        output_path = filedialog.asksaveasfilename(defaultextension=".xlsx",
-                                                   filetypes=[("Excel files", "*.xlsx")],
-                                                   title="Сохранить результат как")
-        if not output_path:
-            return
-
-        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        # Сохраняем результат в Excel
+        with pd.ExcelWriter(safe_path, engine="openpyxl") as writer:
             credit_df.to_excel(writer, sheet_name="Кредитный отчёт", index=False)
             df_full.to_excel(writer, sheet_name="Среднемесячные платежи", index=False)
             df_selected.to_excel(writer, sheet_name="Отобранные", index=False)
 
-        messagebox.showinfo("Готово", f"Результаты сохранены в файл:\n{output_path}")
+        print(f"Результаты сохранены в файл: {output_path}")
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        messagebox.showerror("Ошибка", f"Произошла ошибка:\n{e}")
+        print(f"Произошла ошибка: {e}")
+
 if __name__ == "__main__":
     main()
