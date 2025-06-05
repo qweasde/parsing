@@ -274,51 +274,6 @@ def parse_monthly_payment(xml_path, date_request, preply_df):
     df_selected_with_total = pd.concat([df_selected, pd.DataFrame([total_row])])
     return df_final, df_selected_with_total
 
-
-def mark_duplicates_preply(df):
-    # Убедимся, что даты в нужном формате
-    df['Дата платежа <paymtDate>'] = pd.to_datetime(df['Дата платежа <paymtDate>'])
-    df['Дата обновления информации по платежу <lastUpdatedDt>'] = pd.to_datetime(df['Дата обновления информации по платежу <lastUpdatedDt>'])
-    
-    # Сортируем по UUID, дате платежа, сумме и по дате обновления (по убыванию, чтобы сверху была самая свежая)
-    df = df.sort_values(by=['UUID договора', 'Дата платежа <paymtDate>', 'Сумма платежа <paymtAmt>', 'Дата обновления информации по платежу <lastUpdatedDt>'], ascending=[True, True, True, False])
-    
-    # Функция для маркировки внутри каждой группы
-    def mark_group(group):
-        group = group.copy()
-        # Первая (самая свежая) — Оригинал, остальные — Дубликат
-        group['Маркер дубликатов'] = ['Оригинал'] + ['Дубликат'] * (len(group) - 1)
-        return group
-    
-    # Группируем по UUID + дата платежа + сумма платежа и применяем маркировку
-    df = df.groupby(['UUID договора', 'Дата платежа <paymtDate>', 'Сумма платежа <paymtAmt>'], group_keys=False).apply(mark_group)
-    
-    return df
-
-def mark_duplicates_preply2(df):
-    if 'Маркер дубликатов' not in df.columns:
-        df['Маркер дубликатов'] = 'Оригинал'
-    else:
-        df['Маркер дубликатов'] = 'Оригинал'
-
-    mask = (df['Родительский тег'] == 'preply2') & (df['Тип'] == 'Платёж')
-    df_payments = df[mask]
-
-    group_cols = ['UUID договора', 'Сумма платежа <paymtAmt>', 'Дата платежа <paymtDate>']
-
-    for key, group in df_payments.groupby(group_cols):
-        # Проверяем, одинаковы ли totalAmt в группе
-        if group['Общая сумма платежа <totalAmt>'].nunique() == 1:
-            # Если да, выделяем только самый свежий по дате обновления как оригинал
-            idx_latest = group['Дата обновления информации по платежу <lastUpdatedDt>'].idxmax()
-            df.loc[group.index, 'Маркер дубликатов'] = 'Дубликат'
-            df.loc[idx_latest, 'Маркер дубликатов'] = 'Оригинал'
-        else:
-            # Если разные totalAmt — все оригиналы
-            df.loc[group.index, 'Маркер дубликатов'] = 'Оригинал'
-
-    return df
-
 # Функция парсинга кредитного отчета
 def parse_credit_report(xml_path):
     tree = etree.parse(xml_path)
@@ -370,11 +325,13 @@ def parse_credit_report(xml_path):
 
                     pastdueArrear_block = acc.find("pastdueArrear")
                     if pastdueArrear_block is not None:
-                        contract["Дата расчета <calcDate>"] = pastdueArrear_block.findtext("calcDate")
+                        contract["Дата расчета pastdueArrear <calcDate>"] = pastdueArrear_block.findtext("calcDate")
+                        contract["Сумма просроченной задолжности pastdueArrear <amtPastDue>"] = pastdueArrear_block.findtext("amtPastDue")
 
                     dueArrear_block = acc.find("dueArrear")
                     if dueArrear_block is not None:
-                        contract["Дата возникновения срочной задолженности <startDt>"] = dueArrear_block.findtext("calcDate")
+                        contract["Дата расчета dueArrear <calcDate>"] = dueArrear_block.findtext("calcDate")
+                        contract["Сумма просроченной задолжности dueArrear <amtPastDue>"] = dueArrear_block.findtext("amtPastDue")
 
                 rows.append(contract)
 
@@ -421,6 +378,63 @@ def parse_credit_report(xml_path):
     return df
 
 
+
+def mark_duplicates_preply(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["_original_index"] = df.index  # Сохраняем исходный порядок строк
+
+    def mark_group(group):
+        if len(group) == 1:
+            group["Маркер дубликатов"] = "Оригинал"
+            return group
+
+        group = group.sort_values("Дата обновления информации по платежу <lastUpdatedDt>", ascending=False)
+        group["Маркер дубликатов"] = "Дубликат"
+        group.iloc[0, group.columns.get_loc("Маркер дубликатов")] = "Оригинал"
+        return group
+
+    df_payments = df[df["Тип"] == "Платёж"].copy()
+    df_others = df[df["Тип"] != "Платёж"].copy()
+
+    df_payments = df_payments.groupby(
+        ["UUID договора", "Дата платежа <paymtDate>", "Сумма платежа <paymtAmt>"],
+        group_keys=False
+    ).apply(mark_group)
+
+    df = pd.concat([df_payments, df_others], ignore_index=True)
+
+    # Восстанавливаем исходный порядок
+    df = df.sort_values("_original_index").reset_index(drop=True)
+
+    df = df.drop(columns=["_original_index"])
+
+    return df
+    
+
+def mark_duplicates_preply2(df):
+    if 'Маркер дубликатов' not in df.columns:
+        df['Маркер дубликатов'] = 'Оригинал'
+    else:
+        df['Маркер дубликатов'] = 'Оригинал'
+
+    mask = (df['Родительский тег'] == 'preply2') & (df['Тип'] == 'Платёж')
+    df_payments = df[mask]
+
+    group_cols = ['UUID договора', 'Сумма платежа <paymtAmt>', 'Дата платежа <paymtDate>']
+
+    for key, group in df_payments.groupby(group_cols):
+        # Проверяем, одинаковы ли totalAmt в группе
+        if group['Общая сумма платежа <totalAmt>'].nunique() == 1:
+            # Если да, выделяем только самый свежий по дате обновления как оригинал
+            idx_latest = group['Дата обновления информации по платежу <lastUpdatedDt>'].idxmax()
+            df.loc[group.index, 'Маркер дубликатов'] = 'Дубликат'
+            df.loc[idx_latest, 'Маркер дубликатов'] = 'Оригинал'
+        else:
+            # Если разные totalAmt — все оригиналы
+            df.loc[group.index, 'Маркер дубликатов'] = 'Оригинал'
+
+    return df
+
 def get_unique_filename(path):
     base, ext = os.path.splitext(path)
     counter = 1
@@ -451,7 +465,9 @@ def main():
     try:
         # Парсим кредитный отчёт
         credit_df = parse_credit_report(ko_path)
-        credit_df = parse_credit_report(ko_path)
+
+        # Теперь вызываем mark_duplicates_preply именно для credit_df
+        credit_df = mark_duplicates_preply(credit_df)
         
         # Приведение типов
         credit_df = convert_types_credit_report(credit_df)
