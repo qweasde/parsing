@@ -123,7 +123,7 @@ def evaluate_row_conditions(row, preply_df):
         comments.add("Более 90 дней с даты заявки")
         marker = "Не идет в расчет"
 
-    # Проверка: дубликат
+    # Если дубликат, то добавляем это в комментарий + не идёт в расчет
     if row.get("Маркер дубликатов") == "Дубликат":
         comments.add("Дубликат")
         marker = "Не идет в расчет"
@@ -137,58 +137,96 @@ def evaluate_row_conditions(row, preply_df):
             comments.add("Отсутствуют данные по договору")
             marker = "Не идет в расчет"
         else:
-            for _, preply_row in preply_rows.iterrows():
-                date_request = row["Дата заявки"]
-                lastupdateDt = preply_row.get("Дата обновления информации по займу <lastUpdatedDt>")
-                closedDt = preply_row.get("Плановая дата закрытия <closedDt>")
-                openedDt = preply_row.get("Дата открытия <openedDt>")
-                acctType = preply_row.get("Тип займа <acctType>")
-                principal_outstanding = preply_row.get("Остаток суммы по договору <principalOutstanding>")
-                account_rating = preply_row.get("Статус договора <accountRating>")
-                ownerIndic = preply_row.get("Отношение к кредиту <ownerIndic>")
+            # Функция агрегирования
+            def aggregate_preply_rows(preply_rows):
+                aggregated = {}
+                for col in preply_rows.columns:
+                    values = preply_rows[col].dropna().values
+                    aggregated[col] = values[0] if len(values) > 0 else None
+                return aggregated
 
-                field_map = {
-                    "Дата открытия <openedDt>": openedDt,
-                    "Тип займа <acctType>": acctType,
-                    "Статус договора <accountRating>": account_rating,
-                    "Отношение к кредиту <ownerIndic>": ownerIndic,
-                    "Плановая дата закрытия <closedDt>": closedDt,
-                }
+            aggregated = aggregate_preply_rows(preply_rows)
 
-                missing_fields = [name for name, val in field_map.items() if pd.isna(val)]
-                if missing_fields:
-                    comments.add("Отсутствуют данные в полях: " + ", ".join(missing_fields))
+            date_request = row["Дата заявки"]
+            lastupdateDt = aggregated.get("Дата обновления информации по займу <lastUpdatedDt>")
+            closedDt = aggregated.get("Плановая дата закрытия <closedDt>")
+            openedDt = aggregated.get("Дата открытия <openedDt>")
+            acctType = aggregated.get("Тип займа <acctType>")
+            principal_outstanding = aggregated.get("Остаток суммы по договору <principalOutstanding>")
+            account_rating = aggregated.get("Статус договора <accountRating>")
+            ownerIndic = aggregated.get("Отношение к кредиту <ownerIndic>")
+            # Теги с блока Trade (RUTDF)
+            ownerIndicTrade = aggregated.get("Отношение к кредиту trade <ownerIndic>")
+            openedDtTrade = aggregated.get("Дата открытия trade <openedDt>")
+            closedDtTrade = aggregated.get("Плановая дата закрытия trade <closeDt>")
+            acctTypeTrade = aggregated.get("Тип займа trade <acctType>")
+            loanKindCodeTrade = aggregated.get("Код вида займа (кредита) trade <loanKindCode>")
+
+
+            field_map = {
+                "Дата открытия <openedDt>": openedDt,
+                "Дата открытия trade <openedDt>": openedDtTrade,
+                "Тип займа <acctType>": acctType,
+                "Тип займа trade <acctType>": acctTypeTrade,
+                "Статус договора <accountRating>": account_rating,
+                "Отношение к кредиту <ownerIndic>": ownerIndic,
+                "Отношение к кредиту trade <ownerIndic>": ownerIndicTrade,
+                "Плановая дата закрытия <closedDt>": closedDt,
+                "Плановая дата закрытия trade <closeDt>": closedDtTrade,
+                "Код вида займа (кредита) trade <loanKindCode>": loanKindCodeTrade,
+            }
+
+            missing_fields = []
+            for name, val in field_map.items():
+                if pd.isna(val):
+                    # Попробовать взять trade-поле, если это обычное поле
+                    if "trade" not in name:
+                        alt_name = name.replace(" <", " trade <")
+                    else:
+                        # Попробовать взять обычное поле, если это trade
+                        alt_name = name.replace(" trade <", " <")
+                    alt_val = field_map.get(alt_name)
+                    if pd.isna(alt_val):
+                        missing_fields.append(name)
+            if missing_fields:
+                comments.add("Отсутствуют данные в полях: " + ", ".join(missing_fields))
+                marker = "Не идет в расчет"
+                criteria.add("4")
+
+            if pd.notna(lastupdateDt) and pd.notna(date_request):
+                if (date_request - lastupdateDt).days > 31:
+                    comments.add("Последнее обновление свыше 31 дня")
                     marker = "Не идет в расчет"
-                    criteria.add("4")
+                    criteria.add("1")
 
-                if pd.notna(lastupdateDt) and pd.notna(date_request):
-                    if (date_request - lastupdateDt).days > 31:
-                        comments.add("Последнее обновление свыше 31 дня")
-                        marker = "Не идет в расчет"
-                        criteria.add("1")
+            if pd.notna(closedDt) and pd.notna(date_request):
+                delta_days = (closedDt - date_request).days
 
-                if pd.notna(closedDt) and pd.notna(date_request):
-                    if (closedDt - date_request).days < 31:
-                        comments.add("До плановой даты закрытия менее 31 дня")
-                        marker = "Не идет в расчет"
-                        criteria.add("2")
-
-                try:
-                    if principal_outstanding is None or float(str(principal_outstanding).replace(",", ".")) <= 0:
-                        comments.add("Остаток задолженности равен нулю или отсутствует")
-                        marker = "Не идет в расчет"
-                        criteria.add("3")
-                except:
-                    comments.add("Некорректное значение остатка задолженности")
+                if closedDt < date_request:
+                    comments.add(f"Договор уже закрыт, прошло {abs(delta_days)} дней с даты закрытия")
                     marker = "Не идет в расчет"
+                    criteria.add("2")
+                elif delta_days < 31:
+                    comments.add(f"До плановой даты закрытия менее 31 дня: осталось {delta_days} дней")
+                    marker = "Не идет в расчет"
+                    criteria.add("2")
 
-                try:
-                    if int(account_rating) == 13:
-                        comments.add("Статус кредитного договора закрыт")
-                        marker = "Не идет в расчет"
-                        criteria.add("5")
-                except:
-                    pass
+            try:
+                if principal_outstanding is None or float(str(principal_outstanding).replace(",", ".")) <= 0:
+                    comments.add("Остаток задолженности равен нулю или отсутствует")
+                    marker = "Не идет в расчет"
+                    criteria.add("3")
+            except:
+                comments.add("Некорректное значение остатка задолженности")
+                marker = "Не идет в расчет"
+
+            try:
+                if int(account_rating) == 13:
+                    comments.add("Статус кредитного договора закрыт")
+                    marker = "Не идет в расчет"
+                    criteria.add("5")
+            except:
+                pass
 
     return pd.Series(["; ".join(sorted(comments)), marker, ", ".join(sorted(criteria))])
 
@@ -308,30 +346,34 @@ def parse_credit_report(xml_path):
 
                     paymtCondition_block = acc.find("paymtCondition")
                     if paymtCondition_block is not None:
-                        contract["Дата ближайшего следующего платежа по основному долгу <principalTermsAmtDt>"] = paymtCondition_block.findtext("principalTermsAmtDt")
+                        contract["Дата ближайшего следующего платежа по основному долгу -paymtCondition <principalTermsAmtDt>"] = paymtCondition_block.findtext("principalTermsAmtDt")
 
                     monthAverPaymt_block = acc.find("monthAverPaymt")
                     if monthAverPaymt_block is not None:
-                        contract["Величина среднемесячного платежа <averPaymtAmt>"] = monthAverPaymt_block.findtext("averPaymtAmt")
+                        contract["Величина среднемесячного платежа -monthAverPaymt <averPaymtAmt>"] = monthAverPaymt_block.findtext("averPaymtAmt")
 
                     trade_block = acc.find("trade")
                     if trade_block is not None:
-                        contract["Код вида займа (кредита) <loanKindCode>"] = trade_block.findtext("loanKindCode")
-                        contract["Дата возникновения обязательства субъекта <commitDate>"] = trade_block.findtext("commitDate")
+                        contract["Код вида займа (кредита) trade <loanKindCode>"] = trade_block.findtext("loanKindCode")
+                        contract["Дата возникновения обязательства субъекта trade <commitDate>"] = trade_block.findtext("commitDate")
+                        contract["Тип займа trade <acctType>"] = trade_block.findtext("acctType")
+                        contract["Отношение к кредиту trade <ownerIndic>"] = trade_block.findtext("ownerIndic")
+                        contract["Плановая дата закрытия trade <closeDt>"] = trade_block.findtext("closeDt")
+                        contract["Дата открытия trade <openedDt>"] = trade_block.findtext("openedDt")
 
                     accountAmt_block = acc.find("accountAmt")
                     if accountAmt_block is not None:
-                        contract["Дата расчета <amtDate>"] = accountAmt_block.findtext("amtDate")
+                        contract["Дата расчета -accountAmt <amtDate>"] = accountAmt_block.findtext("amtDate")
 
                     pastdueArrear_block = acc.find("pastdueArrear")
                     if pastdueArrear_block is not None:
-                        contract["Дата расчета pastdueArrear <calcDate>"] = pastdueArrear_block.findtext("calcDate")
-                        contract["Сумма просроченной задолжности pastdueArrear <amtPastDue>"] = pastdueArrear_block.findtext("amtPastDue")
+                        contract["Дата расчета -pastdueArrear <calcDate>"] = pastdueArrear_block.findtext("calcDate")
+                        contract["Сумма просроченной задолжности -pastdueArrear <amtPastDue>"] = pastdueArrear_block.findtext("amtPastDue")
 
                     dueArrear_block = acc.find("dueArrear")
                     if dueArrear_block is not None:
-                        contract["Дата расчета dueArrear <calcDate>"] = dueArrear_block.findtext("calcDate")
-                        contract["Сумма просроченной задолжности dueArrear <amtPastDue>"] = dueArrear_block.findtext("amtPastDue")
+                        contract["Дата расчета -dueArrear <calcDate>"] = dueArrear_block.findtext("calcDate")
+                        contract["Сумма просроченной задолжности -dueArrear <amtPastDue>"] = dueArrear_block.findtext("amtPastDue")
 
                 rows.append(contract)
 
@@ -374,11 +416,11 @@ def parse_credit_report(xml_path):
         payments_df = mark_duplicates_preply(payments_df)
 
     df.loc[payments_df.index, "Маркер дубликатов"] = payments_df["Маркер дубликатов"]
-
+    
     return df
 
 
-
+# Дубликаты в кредитном отчете (preply)
 def mark_duplicates_preply(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["_original_index"] = df.index  # Сохраняем исходный порядок строк
@@ -407,10 +449,9 @@ def mark_duplicates_preply(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("_original_index").reset_index(drop=True)
 
     df = df.drop(columns=["_original_index"])
-
     return df
     
-
+# Дубликаты в кредитном отчете (preply2)
 def mark_duplicates_preply2(df):
     if 'Маркер дубликатов' not in df.columns:
         df['Маркер дубликатов'] = 'Оригинал'
@@ -432,7 +473,6 @@ def mark_duplicates_preply2(df):
         else:
             # Если разные totalAmt — все оригиналы
             df.loc[group.index, 'Маркер дубликатов'] = 'Оригинал'
-
     return df
 
 def get_unique_filename(path):
@@ -458,7 +498,7 @@ def main():
 
     # Жестко задаём пути к файлам
     ssp_path = "C:/Users/islam/Desktop/Договоры/5608421 ССП.xml"
-    ko_path = "C:/Users/islam/Desktop/Договоры/5484455 КО.xml"
+    ko_path = "C:/Users/islam/Desktop/Договоры/5608421 КО.xml"
     output_path = "C:/Users/islam/Desktop/Договоры/result.xlsx"
     safe_path = get_unique_filename(output_path)
 
@@ -472,8 +512,8 @@ def main():
         # Приведение типов
         credit_df = convert_types_credit_report(credit_df)
 
-        # Отбираем только договоры
-        preply_df = credit_df[credit_df["Тип"] == "Договор"].copy()
+        # Отбираем только договоры и договоры RUTDF
+        preply_df = credit_df[credit_df["Тип"].isin(["Договор", "Договор RUTDF"])].copy()
 
         # Парсим среднемесячные платежи
         df_full, df_selected = parse_monthly_payment(ssp_path, date_request, preply_df)
