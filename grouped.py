@@ -4,6 +4,10 @@ from lxml import etree
 import os
 from collections import defaultdict
 from datetime import datetime
+import tkinter as tk
+from tkinter import filedialog, simpledialog, messagebox
+import traceback
+import re
 
 # --- Словари ---
 acct_type_dict = { "1": "Пополнение оборотных средств", "2.1": "Приобретение земельного участка", "2.2": "Приобретение жилого здания", "2.3": "Приобретение нежилого здания", "2.4": "Приобретение жилого помещения на первичном рынке", "2.5": "Приобретение жилого помещения на вторичном рынке", "2.6": "Приобретение нежилого помещения", "2.7": "Приобретение иной недвижимости", "3": "Приобретение основных средств, за исключением недвижимости", "4.1": "Строительство жилого здания", "4.2": "Реконструкция жилого здания", "4.3": "Строительство нежилого здания", "4.4": "Реконструкция нежилого здания", "4.5": "Имущественные права по ДДУ (жильё)", "4.6": "Имущественные права по ДДУ (нежильё)", "4.7": "Инвест. проект (жильё и нежильё)", "4.8": "Инвест. проект (только нежильё)", "4.9": "Инвест. проект (инфраструктура)", "5": "Приобретение ценных бумаг", "6": "Участие в торгах/аукционе", "7": "Вклад в уставной капитал", "8": "Рефинансирование в своей организации", "9": "Рефинансирование в другой организации", "10": "Погашение долга третьего лица", "11": "Финансирование лизинга", "12": "Приобретение прав по займам", "13": "Займ другому лицу", "14": "POS-заем", "15": "Бытовые нужды", "16.1": "Образовательный кредит с господдержкой", "16.2": "Без господдержки", "16.3": "Иное на образование", "17": "Авто с пробегом до 1000 км", "18": "Авто с пробегом от 1000 км", "19": "Цель не определена", "20": "Компенсация по закону о защите инвалидов", "99": "Иная цель" }
@@ -27,7 +31,14 @@ def convert_types_credit_report(df):
         "Дата расчета <amtDate>",
         "Дата расчета <calcDate>",
         "Дата возникновения срочной задолженности <startDt>",
-        "Дата платежа <paymtDate>"
+        "Дата платежа <paymtDate>",
+        "Дата расчета -dueArrear <calcDate>",
+        "Дата расчета -pastdueArrear <calcDate>",
+        "Плановая дата закрытия trade <closeDt>",
+        "Дата возникновения обязательства субъекта trade <commitDate>",
+        "Дата открытия trade <openedDt>",
+        "Дата расчета -accountAmt <amtDate>",
+        "Дата ближайшего следующего платежа по основному долгу -paymtCondition <principalTermsAmtDt>",
     ]
 
     numeric_fields = [
@@ -35,10 +46,13 @@ def convert_types_credit_report(df):
         "Сумма задолженности <amtOutstanding>",
         "Сумма платежа <paymtAmt>",
         "Сумма просроченной задолженности <amtPastDue>",
+        "Сумма просроченной задолжности -dueArrear <amtPastDue>",
+        "Сумма просроченной задолжности -pastdueArrear <amtPastDue>",
         "Текущий баланс <curBalanceAmt>",
         "Остаток суммы по договору <principalOutstanding>",
         "Просрочка <paymtPat>",
         "Ставка <creditTotalAmt>",
+        "Сумма внесенных платежей по процентам <intTotalAmt>",
         "Сумма среднемесячного платежа <averPaymtAmt>"
     ]
 
@@ -107,13 +121,14 @@ combined_payment_fields = {
 
 # Функция отбора ССП
 def evaluate_row_conditions(row, preply_df):
-    
-                
-    comments = set()
-    marker = "Идет в расчет"
-    criteria = set()
+    comments_simple = set()
+    comments_rutdf = set()
+    marker_simple = "Идет в расчет"
+    marker_rutdf = "Идет в расчет"
+    criteria_simple = set()
+    criteria_rutdf = set()
 
-    # Проверка: разница дней >= 90
+    # --- Базовая проверка разницы дней ---
     diff_days = row.get("Разница дней", 0)
     try:
         diff_days = int(diff_days)
@@ -121,72 +136,88 @@ def evaluate_row_conditions(row, preply_df):
         diff_days = 0
 
     if pd.isna(row.get("Разница дней")) or diff_days >= 90:
-        comments.add("Более 90 дней с даты заявки")
-        marker = "Не идет в расчет"
+        comments_simple.add("Более 90 дней с даты заявки")
+        comments_rutdf.add("Более 90 дней с даты заявки")
+        marker_simple = "Не идет в расчет"
+        marker_rutdf = "Не идет в расчет"
 
-    # Если дубликат, то добавляем это в комментарий + не идёт в расчет
+    # --- Проверка на дубликат ---
     if row.get("Маркер дубликатов") == "Дубликат":
-        comments.add("Дубликат")
-        marker = "Не идет в расчет"
+        comments_simple.add("Дубликат")
+        comments_rutdf.add("Дубликат")
+        marker_simple = "Не идет в расчет"
+        marker_rutdf = "Не идет в расчет"
 
-    # Проверка условий по НБКИ (если БКИ == "НБКИ")
+
+    # --- Подготовка отдельных наборов для каждого типа договора ---
+
+
+    # --- Только если БКИ = НБКИ ---
     if row.get("БКИ") == "НБКИ":
         contract_id = row.get("UUID договора")
         contract_rows = preply_df[preply_df["UUID договора"] == contract_id]
 
         if contract_rows.empty:
-            comments.add("Отсутствуют данные по договору")
-            marker = "Не идет в расчет"
+            comments_simple.add("Отсутствуют данные по договору")
+            marker_simple = "Не идет в расчет"
+            comments_rutdf.add("Отсутствуют данные по договору")
+            marker_rutdf = "Не идет в расчет"
         else:
-            # Функция агрегирования
-            preply_rows = contract_rows[contract_rows["Родительский тег"] == "preply"]
-            preply2_rows = contract_rows[contract_rows["Родительский тег"] == "preply2"]
-
             def aggregate_rows(rows):
+                if "Дата обновления информации по займу <lastUpdatedDt>" in rows.columns and not rows.empty:
+                    rows = rows.copy()
+                    rows["Дата обновления информации по займу <lastUpdatedDt>"] = pd.to_datetime(
+                        rows["Дата обновления информации по займу <lastUpdatedDt>"], errors="coerce"
+                    )
+                    idx = rows["Дата обновления информации по займу <lastUpdatedDt>"].idxmax()
+                    rows = rows.loc[[idx]]
+                else:
+                    rows = rows.head(1)
+
                 aggregated = {}
                 for col in rows.columns:
                     values = rows[col].dropna().values
                     aggregated[col] = values[0] if len(values) > 0 else None
                 return aggregated
+            aggregated_preply2 = {}
+            # --- "Договор" ---
+            contract_rows_simple = contract_rows[contract_rows["Тип"] == "Договор"]
+            if not contract_rows_simple.empty:
+                aggregated_preply = aggregate_rows(contract_rows_simple)
 
-            aggregated_preply = aggregate_rows(preply_rows) if not preply_rows.empty else None
-            aggregated_preply2 = aggregate_rows(preply2_rows) if not preply2_rows.empty else None
+                parent_tag = aggregated_preply.get("Родительский тег")
+                date_request = row.get("Дата заявки")
+                lastupdateDt = aggregated_preply.get("Дата обновления информации по займу <lastUpdatedDt>")
+                closedDt = aggregated_preply.get("Плановая дата закрытия <closedDt>")
+                openedDt = aggregated_preply.get("Дата открытия <openedDt>")
+                acctType = aggregated_preply.get("Тип займа <acctType>")
+                principal_outstanding = aggregated_preply.get("Остаток суммы по договору <principalOutstanding>")
+                account_rating = aggregated_preply.get("Статус договора <accountRating>")
+                account_rating_text = aggregated_preply.get("Статус договора <accountRatingText>")
+                ownerIndic = aggregated_preply.get("Отношение к кредиту <ownerIndic>")
+                amtPastDue = aggregated_preply.get("Сумма просроченной задолженности <amtPastDue>")
 
-            aggregated = aggregate_rows(preply_rows)
-            parent_tag = aggregated.get("Родительский тег")
-            date_request = row["Дата заявки"]
-            lastupdateDt = aggregated.get("Дата обновления информации по займу <lastUpdatedDt>")
-            closedDt = aggregated.get("Плановая дата закрытия <closedDt>")
-            openedDt = aggregated.get("Дата открытия <openedDt>")
-            acctType = aggregated.get("Тип займа <acctType>")
-            principal_outstanding = aggregated.get("Остаток суммы по договору <principalOutstanding>")
-            account_rating = aggregated.get("Статус договора <accountRating>")
-            account_rating_text = aggregated.get("Статус договора <accountRatingText>")
-            ownerIndic = aggregated.get("Отношение к кредиту <ownerIndic>")
-            amtPastDue = aggregated.get("Сумма просроченной задолженности <amtPastDue>")
-            # Теги с блока Trade (RUTDF)
-            ownerIndicTrade = aggregated.get("Отношение к кредиту trade <ownerIndic>")
-            openedDtTrade = aggregated.get("Дата открытия trade <openedDt>")
-            closedDtTrade = aggregated.get("Плановая дата закрытия trade <closeDt>")
-            acctTypeTrade = aggregated.get("Тип займа trade <acctType>")
-            loanKindCodeTrade = aggregated.get("Код вида займа (кредита) trade <loanKindCode>")
+                ownerIndicTrade = aggregated_preply2.get("Отношение к кредиту trade <ownerIndic>")
+                openedDtTrade = aggregated_preply2.get("Дата открытия trade <openedDt>")
+                closedDtTrade = aggregated_preply2.get("Плановая дата закрытия trade <closeDt>")
+                acctTypeTrade = aggregated_preply2.get("Тип займа trade <acctType>")
+                loanKindCodeTrade = aggregated_preply2.get("Код вида займа (кредита) trade <loanKindCode>")
 
+                field_map = aggregated_preply
 
-            field_map = {
-                "Дата открытия <openedDt>": openedDt,
-                "Дата открытия trade <openedDt>": openedDtTrade,
-                "Тип займа <acctType>": acctType,
-                "Тип займа trade <acctType>": acctTypeTrade,
-                "Статус договора <accountRating>": account_rating,
-                "Отношение к кредиту <ownerIndic>": ownerIndic,
-                "Отношение к кредиту trade <ownerIndic>": ownerIndicTrade,
-                "Плановая дата закрытия <closedDt>": closedDt,
-                "Плановая дата закрытия trade <closeDt>": closedDtTrade,
-                "Код вида займа (кредита) trade <loanKindCode>": loanKindCodeTrade,
-            }
-            
-            if aggregated_preply:
-                print("Обработка preply")
+                field_map = {
+                    "Дата открытия <openedDt>": openedDt,
+                    "Дата открытия trade <openedDt>": openedDtTrade,
+                    "Тип займа <acctType>": acctType,
+                    "Тип займа trade <acctType>": acctTypeTrade,
+                    "Статус договора <accountRating>": account_rating,
+                    "Отношение к кредиту <ownerIndic>": ownerIndic,
+                    "Отношение к кредиту trade <ownerIndic>": ownerIndicTrade,
+                    "Плановая дата закрытия <closedDt>": closedDt,
+                    "Плановая дата закрытия trade <closeDt>": closedDtTrade,
+                    "Код вида займа (кредита) trade <loanKindCode>": loanKindCodeTrade,
+                }
+
                 missing_fields = []
                 for name, val in field_map.items():
                     if pd.isna(val):
@@ -198,77 +229,93 @@ def evaluate_row_conditions(row, preply_df):
                         if pd.isna(alt_val):
                             missing_fields.append(name)
                 if missing_fields:
-                    comments.add("Отсутствуют данные в полях: " + ", ".join(missing_fields))
-                    marker = "Не идет в расчет"
-                    criteria.add("5.1")
+                    comments_simple.add("Отсутствуют данные в полях: " + ", ".join(missing_fields))
+                    marker_simple = "Не идет в расчет"
+                    criteria_simple.add("5.1")
 
-                # Условие 1: Дата последнего обновления более 30 дней назад
+                # Условие 1: Дата последнего обновления более 31 дней назад
                 if pd.notna(lastupdateDt) and pd.notna(date_request):
-                    if (date_request - lastupdateDt).days > 30:
-                        comments.add("Последнее обновление информации более 30 дней назад")
-                        marker = "Не идет в расчет"
-                        criteria.add("1.1")
+                    if (date_request - lastupdateDt).days > 31:
+                        comments_simple.add("Последнее обновление информации более 31 дней назад")
+                        marker_simple = "Не идет в расчет"
+                        criteria_simple.add("1.1")
+                
+                closedDt_raw = row.get("closedDt")
+                try:
+                    closedDt = pd.to_datetime(closedDt_raw)
+                except Exception:
+                    closedDt = pd.NaT
 
-                # Условие 2: Активный договор, но дата закрытия была более чем за 30 дней до подачи заявки
+                # Условие 2: Активный договор, но дата закрытия была более чем за 31 дней до подачи заявки
                 if pd.notna(closedDt) and pd.notna(date_request):
                     delta_days = (closedDt - date_request).days
 
-                    if account_rating == "0" and closedDt < (date_request - pd.Timedelta(days=30)):
-                        comments.add("Активный договор, но дата закрытия более чем за 30 дней до заявки")
-                        marker = "Не идет в расчет"
-                        criteria.add("2.1")
+                    if account_rating == "0" and closedDt < (date_request - pd.Timedelta(days=31)):
+                        comments_simple.add("Активный договор, но дата закрытия более чем за 31 дней до заявки")
+                        marker_simple = "Не идет в расчет"
+                        criteria_simple.add("2.1")
 
                     elif closedDt < date_request:
-                        comments.add(f"Договор уже закрыт, прошло {abs(delta_days)} дней с даты закрытия")
-                        marker = "Не идет в расчет"
-                        criteria.add("2.1")
+                        comments_simple.add(f"Договор уже закрыт, прошло {abs(delta_days)} дней с даты закрытия")
+                        marker_simple = "Не идет в расчет"
+                        criteria_simple.add("2.1")
 
                     elif delta_days < 31:
-                        comments.add(f"До плановой даты закрытия менее 31 дня: осталось {delta_days} дней")
-                        marker = "Не идет в расчет"
-                        criteria.add("2.1")
+                        comments_simple.add(f"До плановой даты закрытия менее 31 дня: осталось {delta_days} дней")
+                        marker_simple = "Не идет в расчет"
+                        criteria_simple.add("2.1")
 
                 # Условие 3: Активный договор и остаток задолженности = 0 или отсутствует
                 try:
                     if account_rating == "0" and (principal_outstanding is None or float(str(principal_outstanding).replace(",", ".")) <= 0):
-                        comments.add("Активный договор, но остаток задолженности равен нулю или отсутствует")
-                        marker = "Не идет в расчет"
-                        criteria.add("3.1")
+                        comments_simple.add("Активный договор, но остаток задолженности равен нулю или отсутствует")
+                        marker_simple = "Не идет в расчет"
+                        criteria_simple.add("3.1")
                 except:
-                    comments.add("Некорректное значение остатка задолженности")
-                    marker = "Не идет в расчет"
+                    comments_simple.add("Некорректное значение остатка задолженности")
+                    marker_simple = "Не идет в расчет"
 
                 # Условие 4: Просрочен, но просроченной задолженности нет
                 try:
                     if account_rating == "52" and (amtPastDue is None or amtPastDue == 0):
-                        comments.add("Договор с просрочкой, но сумма просроченной задолженности отсутствует или равна 0")
-                        marker = "Не идет в расчет"
-                        criteria.add("4.1")
+                        comments_simple.add("Договор с просрочкой, но сумма просроченной задолженности отсутствует или равна 0")
+                        marker_simple = "Не идет в расчет"
+                        criteria_simple.add("4.1")
                 except:
-                    comments.add("Некорректное значение просроченной задолженности")
-                    marker = "Не идет в расчет"
+                    comments_simple.add("Некорректное значение просроченной задолженности")
+                    marker_simple = "Не идет в расчет"
 
                 # Условие 6: Договор закрыт (account_rating == "13")
                 try:
                     if str(account_rating) == "13":
-                        comments.add("Статус договора — закрыт")
-                        marker = "Не идет в расчет"
-                        criteria.add("6.1")
+                        comments_simple.add("Статус договора — закрыт")
+                        marker_simple = "Не идет в расчет"
+                        criteria_simple.add("6.1")
                 except:
                     pass
 
                 # Условие 7: Счет закрыт и передан в другую организацию (account_rating == "14") и это единственная запись по UUID
                 try:
                     if account_rating == "14" and account_rating_text == "Счет закрыт - переведен на обслуживание в другую организацию":
-                        comments.add("Счет закрыт и передан в другую организацию")
-                        marker = "Не идет в расчет"
-                        criteria.add("7.1")
+                        comments_simple.add("Счет закрыт - переведен на обслуживание в другую организацию")
+                        marker_simple = "Не идет в расчет"
+                        criteria_simple.add("7.1")
                 except:
                     pass
 
-            if aggregated_preply2:
-                print("Обработка preply2")
-                # Проверка на отсутствие обязательных параметров (Условие 3)
+            # --- "Договор RUTDF" ---
+            contract_rows_rutdf = contract_rows[contract_rows["Тип"] == "Договор RUTDF"]
+            if not contract_rows_rutdf.empty:
+                aggregated_preply2 = aggregate_rows(contract_rows_rutdf)
+
+                ownerIndicTrade = aggregated_preply2.get("Отношение к кредиту trade <ownerIndic>")
+                openedDtTrade = aggregated_preply2.get("Дата открытия trade <openedDt>")
+                closedDtTrade = aggregated_preply2.get("Плановая дата закрытия trade <closeDt>")
+                acctTypeTrade = aggregated_preply2.get("Тип займа trade <acctType>")
+                loanKindCodeTrade = aggregated_preply2.get("Код вида займа (кредита) trade <loanKindCode>")
+
+                field_map = aggregated_preply2
+
                 required_fields = [
                     "Тип займа trade <acctType>",
                     "Отношение к кредиту trade <ownerIndic>",
@@ -276,15 +323,15 @@ def evaluate_row_conditions(row, preply_df):
                     "Плановая дата закрытия trade <closeDt>",
                     "Код вида займа (кредита) trade <loanKindCode>"
                 ]
-                
+
                 missing_fields = []
                 for field in required_fields:
                     if pd.isna(field_map.get(field)):
                         missing_fields.append(field)
                 if missing_fields:
-                    comments.add("Отсутствуют данные в полях: " + ", ".join(missing_fields))
-                    marker = "Не идет в расчет"
-                    criteria.add("3.2")
+                    comments_rutdf.add("Отсутствуют данные в полях: " + ", ".join(missing_fields))
+                    marker_rutdf = "Не идет в расчет"
+                    criteria_rutdf.add("3.2")
 
                 # Подгружаем нужные значения
                 loan_indicator = field_map.get("loanIndicator")
@@ -297,37 +344,45 @@ def evaluate_row_conditions(row, preply_df):
 
                 due_amtPastDue = field_map.get("Сумма просроченной задолжности -dueArrear <amtPastDue>")
                 pastdue_amtPastDue = field_map.get("Сумма просроченной задолжности -pastdueArrear <amtPastDue>")
-
-                # Условие 1: loanIndicator отсутствует, закрыт более 31 дня, и просроченной задолженности нет (dueArrear)
-                if pd.isna(loan_indicator) and pd.notna(closedDt) and pd.notna(date_request):
-                    if closedDt < (date_request - pd.Timedelta(days=31)):
-                        if due_amtPastDue in [None, "", "0", "0.00", 0]:
-                            comments.add("loanIndicator отсутствует, договор закрыт более 31 дня назад, и отсутствует просроченная задолженность (dueArrear)")
-                            marker = "Не идет в расчет"
-                            criteria.add("1.2")
-
-                # Условие 2: Проверка по PastdueArrear, если он есть
-                if pastdue_amtPastDue in [None, "", "0", "0.00", 0]:
-                    comments.add("По PastdueArrear сумма просроченной задолженности = 0 или отсутствует")
-                    marker = "Не идет в расчет"
-                    criteria.add("2.2")
-                elif due_amtPastDue in [None, "", "0", "0.00", 0]:
-                    comments.add("PastdueArrear отсутствует или не подходит, но в dueArrear сумма просроченной задолженности = 0 или отсутствует")
-                    marker = "Не идет в расчет"
-                    criteria.add("2.2")
+                
+                def is_zero_or_empty(val):
+                    try:
+                        return pd.isna(val) or float(val) == 0.0
+                    except:
+                        return True
+                    
+                # Условие 1: loan_indicator = null (активный)
+                if pd.isna(loan_indicator):
+                    # Условие 2: Pastdue = 0 или пусто (нет просрочки)
+                    if is_zero_or_empty(pastdue_amtPastDue):
+                        # Условие 3: Outstanding = 0 или пусто (нет просрочки)
+                        if not is_zero_or_empty(due_amtPastDue):
+                            marker_rutdf = "Не идет в расчет"
+                            comments_rutdf.add("DueArrear.amtOutstanding ≠ 0")
+                            criteria_rutdf.add("2.2")
+                        else:
+                            comments_rutdf.add("Активный договор без просрочек (Pastdue=0, Due=0)")
+                            criteria_rutdf.add("1.2")
+                    else:
+                        marker_rutdf = "Не идет в расчет"
+                        comments_rutdf.add("PastdueArrear.amtPastDue ≠ 0")
+                        criteria_rutdf.add("2.2")
                 
                 # Условие 4: loanIndicator есть, но не равен 2
                 if pd.notna(loan_indicator):
                     try:
                         if int(loan_indicator) != 2:
-                            comments.add("loanIndicator присутствует, но не равен 2 — договор закрыт без признака принудительного исполнения")
-                            marker = "Не идет в расчет"
-                            criteria.add("4.2")
+                            comments_rutdf.add("loanIndicator присутствует, но не равен 2 — договор закрыт без признака принудительного исполнения")
+                            marker_rutdf = "Не идет в расчет"
+                            criteria_rutdf.add("4.2")
                     except:
-                        comments.add("Ошибка при обработке loanIndicator")
-                        marker = "Не идет в расчет"
+                        comments_rutdf.add("Ошибка при обработке loanIndicator")
+                        marker_rutdf = "Не идет в расчет"
 
-    return pd.Series(["; ".join(sorted(comments)), marker, ", ".join(sorted(criteria))])
+    return pd.Series([
+        "; ".join(sorted(comments_simple)), marker_simple, ", ".join(sorted(criteria_simple)),
+        "; ".join(sorted(comments_rutdf)), marker_rutdf, ", ".join(sorted(criteria_rutdf))
+    ])
 
 # Функция парсинга ССП и удаления дубликатов
 def parse_monthly_payment(xml_path, date_request, preply_df):
@@ -399,17 +454,18 @@ def parse_monthly_payment(xml_path, date_request, preply_df):
     df_final = pd.concat(result)
 
     # Применяем комментарии и маркеры и критерии
-    df_final[["Комментарии", "Маркер учета", "Критерий отбора"]] = df_final.apply(lambda row: evaluate_row_conditions(row, preply_df), axis=1)
+    df_final[
+        [
+            "Комментарии простого договора",
+            "Маркер простого договора",
+            "Критерий простого договора",
+            "Комментарии RUTDF",
+            "Маркер RUTDF",
+            "Критерий RUTDF",
+        ]
+    ] = df_final.apply(lambda row: evaluate_row_conditions(row, preply_df), axis=1)
 
-    # Отобранные — только те, которые идут в расчет
-    df_selected = df_final[df_final["Маркер учета"] == "Идет в расчет"]
-    
-    # Строка Итого для отобранных
-    total_sum = df_selected["Сумма"].sum()
-    total_row = pd.Series({col: "" for col in df_selected.columns}, name="Итого")
-    total_row["Сумма"] = total_sum
-    df_selected_with_total = pd.concat([df_selected, pd.DataFrame([total_row])])
-    return df_final, df_selected_with_total
+    return df_final
 
 # Функция парсинга кредитного отчета
 def parse_credit_report(xml_path):
@@ -520,7 +576,7 @@ def parse_credit_report(xml_path):
     return df
 
 
-# Дубликаты в кредитном отчете (preply)
+# Дубликаты платежей в кредитном отчете (preply)
 def mark_duplicates_preply(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["_original_index"] = df.index  # Сохраняем исходный порядок строк
@@ -551,7 +607,7 @@ def mark_duplicates_preply(df: pd.DataFrame) -> pd.DataFrame:
     df = df.drop(columns=["_original_index"])
     return df
     
-# Дубликаты в кредитном отчете (preply2)
+# Дубликаты платежей в кредитном отчете (preply2)
 def mark_duplicates_preply2(df):
     if 'Маркер дубликатов' not in df.columns:
         df['Маркер дубликатов'] = 'Оригинал'
@@ -575,61 +631,167 @@ def mark_duplicates_preply2(df):
             df.loc[group.index, 'Маркер дубликатов'] = 'Оригинал'
     return df
 
-def get_unique_filename(path):
-    base, ext = os.path.splitext(path)
-    counter = 1
-    new_path = path
+def get_desktop_processed_path(ko_path):
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    processed_folder = os.path.join(desktop, "Обработанные")
+    os.makedirs(processed_folder, exist_ok=True)
 
-    while os.path.exists(new_path):
-        new_path = f"{base} ({counter}){ext}"
+    # Извлекаем числовую часть из названия файла (например, 5608421 из "5608421 КО.xml")
+    base_name = os.path.splitext(os.path.basename(ko_path))[0]
+    match = re.search(r"\d+", base_name)
+    if match:
+        core_name = match.group()
+    else:
+        core_name = "результат"
+
+    # Базовое имя файла
+    result_filename = f"{core_name}.xlsx"
+    full_path = os.path.join(processed_folder, result_filename)
+
+    # Проверка на уникальность
+    counter = 1
+    unique_path = full_path
+    while os.path.exists(unique_path):
+        unique_filename = f"{core_name} ({counter}).xlsx"
+        unique_path = os.path.join(processed_folder, unique_filename)
         counter += 1
 
-    return new_path
+    return unique_path
+
+def select_file(title):
+    path = filedialog.askopenfilename(title=title, filetypes=[("XML files", "*.xml"), ("All files", "*.*")])
+    if not path:
+        raise Exception(f"{title} не был выбран.")
+    return path
+
+def ask_date_request():
+    while True:
+        date_str = simpledialog.askstring("Дата заявки", "Введите дату заявки (в формате ДД.ММ.ГГГГ):")
+        if date_str is None:
+            raise Exception("Дата заявки не указана.")
+        try:
+            return pd.to_datetime(date_str, format="%d.%m.%Y", errors="raise")
+        except Exception:
+            messagebox.showerror("Ошибка", "Неверный формат даты. Используйте ДД.ММ.ГГГГ.")
+
+def make_monthly_summary_to_excel(df, writer, sheet_name="Сводка по месяцам"):
+    required_cols = [
+        "Дата платежа <paymtDate>",
+        "Сумма платежа <paymtAmt>",
+        "Сумма внесенных платежей по процентам <intTotalAmt>",
+        "Тип"
+    ]
+    if not all(col in df.columns for col in required_cols):
+        print("В датафрейме отсутствуют необходимые колонки для сводки.")
+        return
+
+    df_payments = df[df["Тип"] == "Платёж"].copy()
+
+    for col in ["Сумма платежа <paymtAmt>", "Сумма внесенных платежей по процентам <intTotalAmt>"]:
+        df_payments[col] = (
+            df_payments[col]
+            .astype(str)
+            .str.replace(",", ".")
+            .replace({"None": None, "nan": None})
+        )
+        df_payments[col] = pd.to_numeric(df_payments[col], errors="coerce")
+
+    df_payments["Месяц"] = pd.to_datetime(df_payments["Дата платежа <paymtDate>"], errors="coerce").dt.to_period("M")
+    df_payments = df_payments.dropna(subset=["Месяц"])
+
+    summary = df_payments.groupby("Месяц").agg({
+        "Сумма платежа <paymtAmt>": "sum",
+        "Сумма внесенных платежей по процентам <intTotalAmt>": "sum"
+    }).reset_index()
+
+    summary["Месяц"] = summary["Месяц"].dt.to_timestamp()
+
+    summary.columns = [
+        "Месяц (дата платежа)",
+        "Сумма платежей в месяц",
+        "Сумма процентов в месяц"
+    ]
+
+    summary.to_excel(writer, sheet_name=sheet_name, index=False)
+    print(f"📊 Сводка по месяцам добавлена на лист '{sheet_name}'")
 
 # Окошки
 def main():
-    # Жестко задаём дату заявки
-    date_request_str = "02.01.2025"
-    try:
-        date_request = pd.to_datetime(date_request_str, format="%d.%m.%Y", errors="raise")
-    except Exception as e:
-        print(f"Ошибка преобразования даты: {e}")
-        return
-
-    # Жестко задаём пути к файлам
-    ssp_path = "C:/Users/islam/Desktop/Договоры/5608421 ССП.xml"
-    ko_path = "C:/Users/islam/Desktop/Договоры/5608421 КО.xml"
-    output_path = "C:/Users/islam/Desktop/Договоры/result.xlsx"
-    safe_path = get_unique_filename(output_path)
+    root = tk.Tk()
+    root.withdraw()
 
     try:
-        # Парсим кредитный отчёт
+        # === 1. Получение входных данных ===
+        date_request = ask_date_request()
+        ssp_path = select_file("Выберите файл ССП")
+        ko_path = select_file("Выберите файл КО")
+        output_path = get_desktop_processed_path(ko_path)
+
+        # === 2. Парсинг КО и обработка дубликатов ===
         credit_df = parse_credit_report(ko_path)
+        credit_df_full = credit_df.copy()  # Сохраняем копию до фильтрации
 
-        # Теперь вызываем mark_duplicates_preply именно для credit_df
-        credit_df = mark_duplicates_preply(credit_df)
-        
+        preply_df = credit_df[credit_df["Тип"] == "Договор"].copy()
+        preply2_df = credit_df[credit_df["Тип"] == "Договор RUTDF"].copy()
+        preply_df = mark_duplicates_preply(preply_df)
+        preply2_df = mark_duplicates_preply2(preply2_df)
+        credit_df = pd.concat([preply_df, preply2_df], ignore_index=True)
+
         # Приведение типов
         credit_df = convert_types_credit_report(credit_df)
 
-        # Отбираем только договоры и договоры RUTDF
-        preply_df = credit_df[credit_df["Тип"].isin(["Договор", "Договор RUTDF"])].copy()
+        # === 3. Парсинг и фильтрация ССП ===
+        # Передаем весь credit_df (включая платежи!)
+        df_full = parse_monthly_payment(ssp_path, date_request, credit_df)
 
-        # Парсим среднемесячные платежи
-        df_full, df_selected = parse_monthly_payment(ssp_path, date_request, preply_df)
+        # Определим колонки для простого договора и RUTDF
+        cols_simple = [
+            "БКИ", "UUID договора", "ДатаРасчета", "Сумма", "Валюта", "Дата заявки",
+            "Договор в МКК", "Разница дней", "Маркер дубликатов",
+            "Комментарии простого договора", "Маркер простого договора", "Критерий простого договора"
+        ]
+        cols_rutdf = [
+            "БКИ", "UUID договора", "ДатаРасчета", "Сумма", "Валюта", "Дата заявки",
+            "Договор в МКК", "Разница дней", "Маркер дубликатов",
+            "Комментарии простого договора", "Комментарии RUTDF",
+            "Маркер RUTDF", "Критерий RUTDF"
+        ]
 
-        # Сохраняем результат в Excel
-        with pd.ExcelWriter(safe_path, engine="openpyxl") as writer:
-            credit_df.to_excel(writer, sheet_name="Кредитный отчёт", index=False)
-            df_full.to_excel(writer, sheet_name="Среднемесячные платежи", index=False)
-            df_selected.to_excel(writer, sheet_name="Отобранные", index=False)
+        # === 4. Подготовка таблиц ===
+        df_simple_all = df_full[cols_simple].copy()
+        df_rutdf_all = df_full[cols_rutdf].copy()
 
-        print(f"Результаты сохранены в файл: {output_path}")
+        df_simple_selected = df_simple_all[df_simple_all["Маркер простого договора"] == "Идет в расчет"].copy()
+        df_rutdf_selected = df_rutdf_all[df_rutdf_all["Маркер RUTDF"] == "Идет в расчет"].copy()
+
+        # Добавим строку "Итого" для простого договора
+        if not df_simple_selected.empty:
+            total_simple = df_simple_selected["Сумма"].fillna(0).sum()
+            total_row_simple = pd.Series({col: "" for col in df_simple_selected.columns}, name="Итого")
+            total_row_simple["Сумма"] = total_simple
+            df_simple_selected = pd.concat([df_simple_selected, pd.DataFrame([total_row_simple])])
+
+        # Добавим строку "Итого" для RUTDF
+        if not df_rutdf_selected.empty:
+            total_rutdf = df_rutdf_selected["Сумма"].fillna(0).sum()
+            total_row_rutdf = pd.Series({col: "" for col in df_rutdf_selected.columns}, name="Итого")
+            total_row_rutdf["Сумма"] = total_rutdf
+            df_rutdf_selected = pd.concat([df_rutdf_selected, pd.DataFrame([total_row_rutdf])])
+
+        # === 5. Сохранение в Excel ===
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            credit_df_full.to_excel(writer, sheet_name="Кредитный отчёт", index=False)
+            df_simple_all.to_excel(writer, sheet_name="Среднемесячные платежи", index=False)
+            df_rutdf_all.to_excel(writer, sheet_name="Среднемесячные платежи RUTDF", index=False)
+            df_simple_selected.to_excel(writer, sheet_name="Отобранные", index=False)
+            df_rutdf_selected.to_excel(writer, sheet_name="Отобранные RUTDF", index=False)
+
+            make_monthly_summary_to_excel(credit_df_full, writer)
 
     except Exception as e:
-        import traceback
         traceback.print_exc()
-        print(f"Произошла ошибка: {e}")
+        messagebox.showerror("Ошибка", f"Произошла ошибка:\n{e}")
+
 
 if __name__ == "__main__":
     main()
