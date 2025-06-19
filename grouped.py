@@ -53,7 +53,8 @@ def convert_types_credit_report(df):
         "Просрочка <paymtPat>",
         "Ставка <creditTotalAmt>",
         "Сумма внесенных платежей по процентам <intTotalAmt>",
-        "Сумма среднемесячного платежа <averPaymtAmt>"
+        "Сумма среднемесячного платежа <averPaymtAmt>",
+        "Дни просрочки <daysPastDue>"
     ]
 
     for col in date_fields:
@@ -674,46 +675,178 @@ def ask_date_request():
         except Exception:
             messagebox.showerror("Ошибка", "Неверный формат даты. Используйте ДД.ММ.ГГГГ.")
 
-def make_monthly_summary_to_excel(df, writer, sheet_name="Сводка по месяцам"):
-    required_cols = [
-        "Дата платежа <paymtDate>",
-        "Сумма платежа <paymtAmt>",
-        "Сумма внесенных платежей по процентам <intTotalAmt>",
-        "Тип"
-    ]
-    if not all(col in df.columns for col in required_cols):
+def make_monthly_summary_split(df: pd.DataFrame, writer: pd.ExcelWriter, df_simple_all: pd.DataFrame):
+    required_cols = {
+        "Тип", "Маркер дубликатов", "Дата платежа <paymtDate>",
+        "Сумма платежа <paymtAmt>", "Родительский тег", "Дни просрочки <daysPastDue>"
+    }
+    if not required_cols.issubset(df.columns):
         print("В датафрейме отсутствуют необходимые колонки для сводки.")
         return
 
-    df_payments = df[df["Тип"] == "Платёж"].copy()
+    # Только оригинальные платежи
+    df_payments = df[
+        (df["Тип"] == "Платёж") & 
+        (df["Маркер дубликатов"] == "Оригинал")
+    ].copy()
 
-    for col in ["Сумма платежа <paymtAmt>", "Сумма внесенных платежей по процентам <intTotalAmt>"]:
-        df_payments[col] = (
-            df_payments[col]
-            .astype(str)
-            .str.replace(",", ".")
-            .replace({"None": None, "nan": None})
-        )
-        df_payments[col] = pd.to_numeric(df_payments[col], errors="coerce")
+    if df_payments.empty:
+        print("Нет оригинальных платежей для сводки.")
+        return
 
-    df_payments["Месяц"] = pd.to_datetime(df_payments["Дата платежа <paymtDate>"], errors="coerce").dt.to_period("M")
-    df_payments = df_payments.dropna(subset=["Месяц"])
+    # Преобразования
+    df_payments["Дата платежа <paymtDate>"] = pd.to_datetime(df_payments["Дата платежа <paymtDate>"], errors="coerce")
+    df_payments["Сумма платежа <paymtAmt>"] = pd.to_numeric(
+        df_payments["Сумма платежа <paymtAmt>"].astype(str).str.replace(",", "."),
+        errors="coerce"
+    )
+    df_payments["Дни просрочки <daysPastDue>"] = pd.to_numeric(
+        df_payments["Дни просрочки <daysPastDue>"].astype(str).str.replace(",", "."),
+        errors="coerce"
+    )
 
-    summary = df_payments.groupby("Месяц").agg({
-        "Сумма платежа <paymtAmt>": "sum",
-        "Сумма внесенных платежей по процентам <intTotalAmt>": "sum"
-    }).reset_index()
+    # Назначаем Месяц
+    df_payments["Месяц"] = df_payments["Дата платежа <paymtDate>"].dt.to_period("M")
 
-    summary["Месяц"] = summary["Месяц"].dt.to_timestamp()
+    # Группировка preply — всё без фильтра
+    df_preply = df_payments[df_payments["Родительский тег"] == "preply"]
+    sum_preply = df_preply.groupby("Месяц")["Сумма платежа <paymtAmt>"].sum()
 
-    summary.columns = [
-        "Месяц (дата платежа)",
-        "Сумма платежей в месяц",
-        "Сумма процентов в месяц"
+    # preply2 — фильтрация по просрочке < 30 ИЛИ NaN
+    df_preply2 = df_payments[
+        (df_payments["Родительский тег"] == "preply2") &
+        (df_payments["Маркер дубликатов"] == "Оригинал") &
+        ((df_payments["Дни просрочки <daysPastDue>"].isna()) | (df_payments["Дни просрочки <daysPastDue>"] < 30))
     ]
+    sum_preply2 = df_preply2.groupby("Месяц")["Сумма платежа <paymtAmt>"].sum()
 
-    summary.to_excel(writer, sheet_name=sheet_name, index=False)
-    print(f"📊 Сводка по месяцам добавлена на лист '{sheet_name}'")
+    # Сбор диапазона месяцев
+    combined = pd.concat([sum_preply, sum_preply2])
+    if combined.empty:
+        print("Нет данных для формирования сводки.")
+        return
+
+    start = combined.index.min()
+    if start.year < 2020:
+        start = combined.index[combined.index.to_timestamp() >= pd.Timestamp("2020-01-01")].min()
+    end = combined.index.max()
+
+    all_months = pd.period_range(start=start, end=end, freq="M")
+
+    # Финальная таблица
+    df_summary = pd.DataFrame({"Месяц": all_months})
+    df_summary["Сумма платежей в месяц preply"] = df_summary["Месяц"].map(sum_preply).fillna(0)
+    df_summary["Сумма платежей в месяц preply2"] = df_summary["Месяц"].map(sum_preply2).fillna(0)
+    df_summary["Разница"] = df_summary["Сумма платежей в месяц preply"] - df_summary["Сумма платежей в месяц preply2"]
+
+    # Создаем новый столбец с комментарием
+    df_summary["Комментарий"] = ""
+    mask_added = (df_summary["Сумма платежей в месяц preply"] == 0) & (df_summary["Сумма платежей в месяц preply2"] == 0)
+    df_summary.loc[mask_added, "Комментарий"] = "Месяц добавлен автоматически"
+
+    # ---- Вставляем блок вычисления СМД ----
+
+    # Получаем дату запроса из df_simple_all (предполагается, что есть столбец 'date_request')
+    date_request = pd.to_datetime(df_simple_all["Дата заявки"].iloc[0], format="%d.%m.%Y", errors="coerce")
+
+    if pd.isna(date_request):
+        print("Ошибка: дата запроса отсутствует или некорректна.")
+    else:
+        for col in ["Сумма платежей в месяц preply", "Сумма платежей в месяц preply2", "Разница"]:
+            df_summary[col] = df_summary[col].astype(str).str.replace(",", ".").astype(float)
+
+        df_summary["Месяц_дата"] = df_summary["Месяц"].dt.to_timestamp()
+
+        # Вычисляем стартовый месяц — первый день предыдущего месяца от date_request
+        start_month = (date_request - pd.DateOffset(months=1)).replace(day=1)
+        print(f"date_request: {date_request}, стартовый месяц: {start_month}")
+
+        if start_month not in df_summary["Месяц_дата"].values:
+            print(f"Стартовый месяц {start_month} не найден в данных, используем минимальный месяц.")
+            start_month = df_summary["Месяц_дата"].min()
+        print(f"Финальный стартовый месяц: {start_month}")
+
+        def find_actual_start(start_date, series):
+            # Получаем индекс по дате
+            try:
+                idx = series.index.get_loc(start_date)
+            except KeyError:
+                print(f"⚠️ Дата {start_date} не найдена, используем первую позицию")
+                idx = 0
+
+            # Ищем до 6 месяцев вперед первый с платежом != 0
+            for i in range(idx, min(idx + 6, len(series))):
+                if series.iat[i] != 0:
+                    print(f"Найден платеж != 0 в месяце {series.index[i]} на позиции {i}")
+                    return i
+
+            # Если все нули, возвращаем индекс + 6 (7-й месяц)
+            fallback_idx = idx + 6 if idx + 6 < len(series) else idx
+            print(f"Все 6 месяцев платежи = 0, берём месяц под индексом {fallback_idx}")
+            return fallback_idx
+
+        # Индексы по дате
+        df_summary = df_summary.sort_values("Месяц_дата", ascending=True).reset_index(drop=True)  # обязательно отсортировать по дате по возрастанию
+
+        preply_series = df_summary.set_index("Месяц_дата")["Сумма платежей в месяц preply"]
+        preply2_series = df_summary.set_index("Месяц_дата")["Сумма платежей в месяц preply2"]
+
+        actual_start_idx_preply = find_actual_start(start_month, preply_series)
+        actual_start_idx_preply2 = find_actual_start(start_month, preply2_series)
+
+        print(f"actual_start_idx_preply: {actual_start_idx_preply}")
+        print(f"actual_start_idx_preply2: {actual_start_idx_preply2}")
+
+        # Для preply — берём 24 месяца вниз (в сторону уменьшения индекса)
+        start_idx = actual_start_idx_preply
+        end_idx = max(start_idx - 23, 0)
+        slice_preply = preply_series.iloc[end_idx:start_idx + 1]
+
+        # Для preply2 — то же самое
+        start_idx2 = actual_start_idx_preply2
+        end_idx2 = max(start_idx2 - 23, 0)
+        slice_preply2 = preply2_series.iloc[end_idx2:start_idx2 + 1]
+
+        def count_months_with_payment(slice_):
+            count = (slice_ != 0).sum()
+            return max(count, 18)
+
+        count_preply = count_months_with_payment(slice_preply)
+        count_preply2 = count_months_with_payment(slice_preply2)
+
+        print(f"count_preply: {count_preply}, count_preply2: {count_preply2}")
+        print(f"slice_preply.sum(): {slice_preply.sum()}, slice_preply2.sum(): {slice_preply2.sum()}")
+
+        smd_preply = slice_preply.sum() / count_preply * 1.3 if count_preply > 0 else 0
+        smd_preply2 = slice_preply2.sum() / count_preply2 * 1.3 if count_preply2 > 0 else 0
+
+        # Добавляем итоговую строку с результатом
+        new_row = {
+            "Месяц": "СМД по КИ",
+            "Сумма платежей в месяц preply": smd_preply,
+            "Сумма платежей в месяц preply2": smd_preply2,
+            "Разница": smd_preply - smd_preply2,
+            "Комментарий": ""
+        }
+        df_summary = pd.concat([df_summary, pd.DataFrame([new_row])], ignore_index=True)
+        print(f"Количество месяцев с платежом preply: {(slice_preply != 0).sum()}")
+        print(f"Количество месяцев с платежом preply2: {(slice_preply2 != 0).sum()}")
+        print("Месяцы с платежами preply:")
+        print(slice_preply[slice_preply != 0])
+
+        print("Месяцы с платежами preply2:")
+        print(slice_preply2[slice_preply2 != 0])
+        
+        # Сортируем по дате, кроме итоговой строки
+        df_data = df_summary[df_summary["Месяц"] != "СМД по КИ"].copy()
+        df_data = df_data.sort_values("Месяц_дата", ascending=False)
+        df_data["Месяц"] = df_data["Месяц_дата"].dt.strftime("%d.%m.%Y")
+
+        # Добавляем итоговую строку обратно
+        df_summary = pd.concat([df_data, df_summary[df_summary["Месяц"] == "СМД по КИ"]], ignore_index=True)
+
+        # Сохраняем
+        df_summary.to_excel(writer, sheet_name="Сводка платежей", index=False)
 
 # Окошки
 def main():
@@ -761,32 +894,13 @@ def main():
         df_simple_all = df_full[cols_simple].copy()
         df_rutdf_all = df_full[cols_rutdf].copy()
 
-        df_simple_selected = df_simple_all[df_simple_all["Маркер простого договора"] == "Идет в расчет"].copy()
-        df_rutdf_selected = df_rutdf_all[df_rutdf_all["Маркер RUTDF"] == "Идет в расчет"].copy()
-
-        # Добавим строку "Итого" для простого договора
-        if not df_simple_selected.empty:
-            total_simple = df_simple_selected["Сумма"].fillna(0).sum()
-            total_row_simple = pd.Series({col: "" for col in df_simple_selected.columns}, name="Итого")
-            total_row_simple["Сумма"] = total_simple
-            df_simple_selected = pd.concat([df_simple_selected, pd.DataFrame([total_row_simple])])
-
-        # Добавим строку "Итого" для RUTDF
-        if not df_rutdf_selected.empty:
-            total_rutdf = df_rutdf_selected["Сумма"].fillna(0).sum()
-            total_row_rutdf = pd.Series({col: "" for col in df_rutdf_selected.columns}, name="Итого")
-            total_row_rutdf["Сумма"] = total_rutdf
-            df_rutdf_selected = pd.concat([df_rutdf_selected, pd.DataFrame([total_row_rutdf])])
-
         # === 5. Сохранение в Excel ===
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             credit_df_full.to_excel(writer, sheet_name="Кредитный отчёт", index=False)
-            df_simple_all.to_excel(writer, sheet_name="Среднемесячные платежи", index=False)
-            df_rutdf_all.to_excel(writer, sheet_name="Среднемесячные платежи RUTDF", index=False)
-            df_simple_selected.to_excel(writer, sheet_name="Отобранные", index=False)
-            df_rutdf_selected.to_excel(writer, sheet_name="Отобранные RUTDF", index=False)
+            df_simple_all.to_excel(writer, sheet_name="Среднемесячные платежи preply", index=False)
+            df_rutdf_all.to_excel(writer, sheet_name="Среднемесячные платежи preply2", index=False)
 
-            make_monthly_summary_to_excel(credit_df_full, writer)
+            make_monthly_summary_split(credit_df_full, writer, df_simple_all)
 
     except Exception as e:
         traceback.print_exc()
