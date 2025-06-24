@@ -208,27 +208,17 @@ def evaluate_row_conditions(row, preply_df):
 
                 field_map = {
                     "Дата открытия <openedDt>": openedDt,
-                    "Дата открытия trade <openedDt>": openedDtTrade,
                     "Тип займа <acctType>": acctType,
-                    "Тип займа trade <acctType>": acctTypeTrade,
                     "Статус договора <accountRating>": account_rating,
                     "Отношение к кредиту <ownerIndic>": ownerIndic,
-                    "Отношение к кредиту trade <ownerIndic>": ownerIndicTrade,
                     "Плановая дата закрытия <closedDt>": closedDt,
-                    "Плановая дата закрытия trade <closeDt>": closedDtTrade,
-                    "Код вида займа (кредита) trade <loanKindCode>": loanKindCodeTrade,
                 }
 
                 missing_fields = []
                 for name, val in field_map.items():
                     if pd.isna(val):
-                        if "trade" not in name:
-                            alt_name = name.replace(" <", " trade <")
-                        else:
-                            alt_name = name.replace(" trade <", " <")
-                        alt_val = field_map.get(alt_name)
-                        if pd.isna(alt_val):
-                            missing_fields.append(name)
+                        missing_fields.append(name)
+
                 if missing_fields:
                     comments_simple.add("Отсутствуют данные в полях: " + ", ".join(missing_fields))
                     marker_simple = "Не идет в расчет"
@@ -308,12 +298,7 @@ def evaluate_row_conditions(row, preply_df):
             contract_rows_rutdf = contract_rows[contract_rows["Тип"] == "Договор RUTDF"]
             if not contract_rows_rutdf.empty:
                 aggregated_preply2 = aggregate_rows(contract_rows_rutdf)
-
-                ownerIndicTrade = aggregated_preply2.get("Отношение к кредиту trade <ownerIndic>")
-                openedDtTrade = aggregated_preply2.get("Дата открытия trade <openedDt>")
-                closedDtTrade = aggregated_preply2.get("Плановая дата закрытия trade <closeDt>")
-                acctTypeTrade = aggregated_preply2.get("Тип займа trade <acctType>")
-                loanKindCodeTrade = aggregated_preply2.get("Код вида займа (кредита) trade <loanKindCode>")
+                aggregated_preply = aggregate_rows(contract_rows[contract_rows["Тип"] == "Договор"]) if not contract_rows[contract_rows["Тип"] == "Договор"].empty else {}
 
                 field_map = aggregated_preply2
 
@@ -327,8 +312,17 @@ def evaluate_row_conditions(row, preply_df):
 
                 missing_fields = []
                 for field in required_fields:
-                    if pd.isna(field_map.get(field)):
-                        missing_fields.append(field)
+                    val = field_map.get(field)
+                    if pd.isna(val):
+                        # Пробуем подставить значение из поля без trade
+                        alt_field = field.replace(" trade <", " <")
+                        alt_val = aggregated_preply.get(alt_field) if aggregated_preply else None
+                        if pd.isna(alt_val):
+                            missing_fields.append(field)
+                        else:
+                            # Подставляем значение из альтернативного поля, если нужно
+                            field_map[field] = alt_val
+
                 if missing_fields:
                     comments_rutdf.add("Отсутствуют данные в полях: " + ", ".join(missing_fields))
                     marker_rutdf = "Не идет в расчет"
@@ -343,8 +337,8 @@ def evaluate_row_conditions(row, preply_df):
                     except:
                         closedDt = None
 
-                due_amtPastDue = field_map.get("Сумма просроченной задолжности -dueArrear <amtPastDue>")
                 pastdue_amtPastDue = field_map.get("Сумма просроченной задолжности -pastdueArrear <amtPastDue>")
+                due_amtOutstanding = field_map.get("Сумма задолжности -dueArrear <amtOutstanding>")
                 
                 def is_zero_or_empty(val):
                     try:
@@ -354,20 +348,19 @@ def evaluate_row_conditions(row, preply_df):
                     
                 # Условие 1: loan_indicator = null (активный)
                 if pd.isna(loan_indicator):
-                    # Условие 2: Pastdue = 0 или пусто (нет просрочки)
-                    if is_zero_or_empty(pastdue_amtPastDue):
-                        # Условие 3: Outstanding = 0 или пусто (нет просрочки)
-                        if not is_zero_or_empty(due_amtPastDue):
+                    if not is_zero_or_empty(pastdue_amtPastDue):
+                        marker_rutdf = "Не идет в расчет"
+                        comments_rutdf.add("PastdueArrear.amtPastDue ≠ 0, есть просроченная задолженность")
+                        criteria_rutdf.add("2.2")
+                    else:
+                        
+                        if not is_zero_or_empty(due_amtOutstanding):
                             marker_rutdf = "Не идет в расчет"
-                            comments_rutdf.add("DueArrear.amtOutstanding ≠ 0")
+                            comments_rutdf.add("DueArrear.amtOutstanding ≠ 0, есть остаток задолженности")
                             criteria_rutdf.add("2.2")
                         else:
-                            comments_rutdf.add("Активный договор без просрочек (Pastdue=0, Due=0)")
+                            
                             criteria_rutdf.add("1.2")
-                    else:
-                        marker_rutdf = "Не идет в расчет"
-                        comments_rutdf.add("PastdueArrear.amtPastDue ≠ 0")
-                        criteria_rutdf.add("2.2")
                 
                 # Условие 4: loanIndicator есть, но не равен 2
                 if pd.notna(loan_indicator):
@@ -385,44 +378,62 @@ def evaluate_row_conditions(row, preply_df):
         "; ".join(sorted(comments_rutdf)), marker_rutdf, ", ".join(sorted(criteria_rutdf))
     ])
 
+def ask_date_request():
+    while True:
+        date_str = simpledialog.askstring("Дата заявки", "Введите дату заявки (в формате ДД.ММ.ГГГГ):")
+        if date_str is None:
+            raise Exception("Дата заявки не указана.")
+        try:
+            return pd.to_datetime(date_str, format="%d.%m.%Y", errors="raise")
+        except Exception:
+            messagebox.showerror("Ошибка", "Неверный формат даты. Используйте ДД.ММ.ГГГГ.")
+
 # Функция парсинга ССП и удаления дубликатов
 def parse_monthly_payment(xml_path, date_request, preply_df):
-    contract_mkk = os.path.splitext(os.path.basename(xml_path))[0][:7]
+    contract_mkk = os.path.splitext(os.path.basename(xml_path))[0]
+    first_word = contract_mkk.split()[0]
     tree = ET.parse(xml_path)
     root = tree.getroot()
+    if root.tag == "ОтветНаЗапросСведений":
+        parents = root.findall("Сведения")
+    elif root.tag == "СведенияОПлатежах":
+        parents = [root]
+    else:
+        parents = [root] 
 
     data = []
-    for kbki in root.findall("КБКИ"):
-        ogrn = kbki.attrib.get("ОГРН")
-        bki_name = ogrn_to_bki.get(ogrn, ogrn)
+    for parent in parents:
+        for kbki in parent.findall("КБКИ"):
+            ogrn = kbki.attrib.get("ОГРН")
+            bki_name = ogrn_to_bki.get(ogrn, ogrn)
 
-        obligations = kbki.find("Обязательства")
-        if obligations is None:
-            continue
-
-        bki = obligations.find("БКИ")
-        if bki is None:
-            continue
-
-        for dogovor in bki.findall("Договор"):
-            uid = dogovor.attrib.get("УИД")
-            payment = dogovor.find("СреднемесячныйПлатеж")
-            if payment is None:
+            obligations = kbki.find("Обязательства")
+            if obligations is None:
                 continue
 
-            date_calc = payment.attrib.get("ДатаРасчета")
-            amount = payment.text.strip() if payment.text else None
-            currency = payment.attrib.get("Валюта")
+            bki = obligations.find("БКИ")
+            if bki is None:
+                continue
 
-            data.append({
-                "БКИ": bki_name,
-                "UUID договора": uid,
-                "ДатаРасчета": date_calc,
-                "Сумма": amount,
-                "Валюта": currency,
-                "Дата заявки": date_request,
-                "Договор в МКК": contract_mkk
-            })
+            for dogovor in bki.findall("Договор"):
+                uid = dogovor.attrib.get("УИД")
+                payment = dogovor.find("СреднемесячныйПлатеж")
+                if payment is None:
+                    continue
+
+                date_calc = payment.attrib.get("ДатаРасчета")
+                amount = payment.text.strip() if payment.text else None
+                currency = payment.attrib.get("Валюта")
+
+                data.append({
+                    "БКИ": bki_name,
+                    "UUID договора": uid,
+                    "ДатаРасчета": date_calc,
+                    "Сумма": amount,
+                    "Валюта": currency,
+                    "Дата заявки": date_request,
+                    "Договор в МКК": first_word
+                })
 
     df = pd.DataFrame(data)
 
@@ -437,16 +448,25 @@ def parse_monthly_payment(xml_path, date_request, preply_df):
 
     for uid, group in grouped:
         group = group.copy()
-        has_nbki = (group["БКИ"] == "НБКИ").any()
-        if has_nbki:
-            nbki_rows = group[group["БКИ"] == "НБКИ"]
-            idx_max = nbki_rows["ДатаРасчета"].idxmax()
-            group["Маркер дубликатов"] = "Дубликат"
-            group.loc[idx_max, "Маркер дубликатов"] = "Оригинал"
-        else:
-            idx_max = group["ДатаРасчета"].idxmax()
-            group["Маркер дубликатов"] = "Дубликат"
-            group.loc[idx_max, "Маркер дубликатов"] = "Оригинал"
+        group["Маркер дубликатов"] = "Дубликат"
+
+        # 1. Отбор по максимальной дате расчёта
+        max_date = group["ДатаРасчета"].max()
+        candidates = group[group["ДатаРасчета"] == max_date]
+
+        # 2. Если таких несколько — отбор по максимальной сумме
+        if len(candidates) > 1:
+            max_amount = candidates["Сумма"].max()
+            candidates = candidates[candidates["Сумма"] == max_amount]
+
+        # 3. Если таких несколько — отбор по НБКИ
+        if len(candidates) > 1 and (candidates["БКИ"] == "НБКИ").any():
+            candidates = candidates[candidates["БКИ"] == "НБКИ"]
+
+        # 4. Финальный выбор — первая подходящая
+        idx_final = candidates.index[0]
+        group.loc[idx_final, "Маркер дубликатов"] = "Оригинал"
+
         result.append(group)
 
     if not result:
@@ -522,15 +542,40 @@ def parse_credit_report(xml_path):
                     if accountAmt_block is not None:
                         contract["Дата расчета -accountAmt <amtDate>"] = accountAmt_block.findtext("amtDate")
 
-                    pastdueArrear_block = acc.find("pastdueArrear")
-                    if pastdueArrear_block is not None:
-                        contract["Дата расчета -pastdueArrear <calcDate>"] = pastdueArrear_block.findtext("calcDate")
-                        contract["Сумма просроченной задолжности -pastdueArrear <amtPastDue>"] = pastdueArrear_block.findtext("amtPastDue")
+                    def parse_date(date_str):
+                        try:
+                            return datetime.strptime(date_str, "%Y-%m-%d")
+                        except:
+                            return None
 
-                    dueArrear_block = acc.find("dueArrear")
-                    if dueArrear_block is not None:
-                        contract["Дата расчета -dueArrear <calcDate>"] = dueArrear_block.findtext("calcDate")
-                        contract["Сумма просроченной задолжности -dueArrear <amtPastDue>"] = dueArrear_block.findtext("amtPastDue")
+                    # Самый свежий pastdueArrear по calcDate
+                    pastdue_latest = None
+                    pastdue_amt = None
+
+                    for past in acc.findall("pastdueArrear"):
+                        calc_date_str = past.findtext("calcDate")
+                        calc_date = parse_date(calc_date_str)
+                        if calc_date and (pastdue_latest is None or calc_date > pastdue_latest):
+                            pastdue_latest = calc_date
+                            pastdue_amt = past.findtext("amtPastDue")
+                    
+                    contract["Дата расчета -pastdueArrear <calcDate>"] = pastdue_latest.strftime("%Y-%m-%d") if pastdue_latest else None
+                    contract["Сумма просроченной задолжности -pastdueArrear <amtPastDue>"] = pastdue_amt
+
+
+                    # Самый свежий dueArrear по calcDate
+                    due_latest = None
+                    due_outstanding = None
+
+                    for due in acc.findall("dueArrear"):
+                        calc_date_str = due.findtext("calcDate")
+                        calc_date = parse_date(calc_date_str)
+                        if calc_date and (due_latest is None or calc_date > due_latest):
+                            due_latest = calc_date
+                            due_outstanding = due.findtext("amtOutstanding")
+
+                    contract["Дата расчета -dueArrear <calcDate>"] = due_latest.strftime("%Y-%m-%d") if due_latest else None
+                    contract["Сумма задолжности -dueArrear <amtOutstanding>"] = due_outstanding
 
                 rows.append(contract)
 
@@ -665,16 +710,7 @@ def select_file(title):
         raise Exception(f"{title} не был выбран.")
     return path
 
-def ask_date_request():
-    while True:
-        date_str = simpledialog.askstring("Дата заявки", "Введите дату заявки (в формате ДД.ММ.ГГГГ):")
-        if date_str is None:
-            raise Exception("Дата заявки не указана.")
-        try:
-            return pd.to_datetime(date_str, format="%d.%m.%Y", errors="raise")
-        except Exception:
-            messagebox.showerror("Ошибка", "Неверный формат даты. Используйте ДД.ММ.ГГГГ.")
-
+# Сводка по месяцам + СМД по КИ
 def make_monthly_summary_split(df: pd.DataFrame, writer: pd.ExcelWriter, df_simple_all: pd.DataFrame):
     required_cols = {
         "Тип", "Маркер дубликатов", "Дата платежа <paymtDate>",
@@ -872,11 +908,10 @@ def main():
 
         # Приведение типов
         credit_df = convert_types_credit_report(credit_df)
-
+        
         # === 3. Парсинг и фильтрация ССП ===
         # Передаем весь credit_df (включая платежи!)
         df_full = parse_monthly_payment(ssp_path, date_request, credit_df)
-
         # Определим колонки для простого договора и RUTDF
         cols_simple = [
             "БКИ", "UUID договора", "ДатаРасчета", "Сумма", "Валюта", "Дата заявки",
