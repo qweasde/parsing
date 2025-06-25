@@ -129,7 +129,7 @@ def evaluate_row_conditions(row, preply_df):
     criteria_simple = set()
     criteria_rutdf = set()
 
-    # --- Базовая проверка разницы дней ---
+    # Базовая проверка разницы дней
     diff_days = row.get("Разница дней", 0)
     try:
         diff_days = int(diff_days)
@@ -142,7 +142,7 @@ def evaluate_row_conditions(row, preply_df):
         marker_simple = "Не идет в расчет"
         marker_rutdf = "Не идет в расчет"
 
-    # --- Проверка на дубликат ---
+    # Проверка на дубликат
     if row.get("Маркер дубликатов") == "Дубликат":
         comments_simple.add("Дубликат")
         comments_rutdf.add("Дубликат")
@@ -150,10 +150,7 @@ def evaluate_row_conditions(row, preply_df):
         marker_rutdf = "Не идет в расчет"
 
 
-    # --- Подготовка отдельных наборов для каждого типа договора ---
-
-
-    # --- Только если БКИ = НБКИ ---
+    # Только если БКИ = НБКИ
     if row.get("БКИ") == "НБКИ":
         contract_id = row.get("UUID договора")
         contract_rows = preply_df[preply_df["UUID договора"] == contract_id]
@@ -181,12 +178,12 @@ def evaluate_row_conditions(row, preply_df):
                     aggregated[col] = values[0] if len(values) > 0 else None
                 return aggregated
             aggregated_preply2 = {}
-            # --- "Договор" ---
+
+            # "Договор"
             contract_rows_simple = contract_rows[contract_rows["Тип"] == "Договор"]
             if not contract_rows_simple.empty:
                 aggregated_preply = aggregate_rows(contract_rows_simple)
 
-                parent_tag = aggregated_preply.get("Родительский тег")
                 date_request = row.get("Дата заявки")
                 lastupdateDt = aggregated_preply.get("Дата обновления информации по займу <lastUpdatedDt>")
                 closedDt = aggregated_preply.get("Плановая дата закрытия <closedDt>")
@@ -197,12 +194,6 @@ def evaluate_row_conditions(row, preply_df):
                 account_rating_text = aggregated_preply.get("Статус договора <accountRatingText>")
                 ownerIndic = aggregated_preply.get("Отношение к кредиту <ownerIndic>")
                 amtPastDue = aggregated_preply.get("Сумма просроченной задолженности <amtPastDue>")
-
-                ownerIndicTrade = aggregated_preply2.get("Отношение к кредиту trade <ownerIndic>")
-                openedDtTrade = aggregated_preply2.get("Дата открытия trade <openedDt>")
-                closedDtTrade = aggregated_preply2.get("Плановая дата закрытия trade <closeDt>")
-                acctTypeTrade = aggregated_preply2.get("Тип займа trade <acctType>")
-                loanKindCodeTrade = aggregated_preply2.get("Код вида займа (кредита) trade <loanKindCode>")
 
                 field_map = aggregated_preply
 
@@ -224,10 +215,10 @@ def evaluate_row_conditions(row, preply_df):
                     marker_simple = "Не идет в расчет"
                     criteria_simple.add("5.1")
 
-                # Условие 1: Дата последнего обновления более 31 дней назад
+                # Условие 1: Дата последнего обновления более 31 дня назад
                 if pd.notna(lastupdateDt) and pd.notna(date_request):
                     if (date_request - lastupdateDt).days > 31:
-                        comments_simple.add("Последнее обновление информации более 31 дней назад")
+                        comments_simple.add("Последнее обновление информации более 31 дня назад")
                         marker_simple = "Не идет в расчет"
                         criteria_simple.add("1.1")
                 
@@ -294,12 +285,10 @@ def evaluate_row_conditions(row, preply_df):
                 except:
                     pass
 
-            # --- "Договор RUTDF" ---
+            # "Договор RUTDF"
             contract_rows_rutdf = contract_rows[contract_rows["Тип"] == "Договор RUTDF"]
             if not contract_rows_rutdf.empty:
                 aggregated_preply2 = aggregate_rows(contract_rows_rutdf)
-                aggregated_preply = aggregate_rows(contract_rows[contract_rows["Тип"] == "Договор"]) if not contract_rows[contract_rows["Тип"] == "Договор"].empty else {}
-
                 field_map = aggregated_preply2
 
                 required_fields = [
@@ -310,68 +299,61 @@ def evaluate_row_conditions(row, preply_df):
                     "Код вида займа (кредита) trade <loanKindCode>"
                 ]
 
+                def set_marker_rutdf(new_marker):
+                    nonlocal marker_rutdf
+                    if new_marker == "Не идет в расчет":
+                        marker_rutdf = new_marker
+
+                # Условие 3: Проверка отсутствия обязательных полей
                 missing_fields = []
                 for field in required_fields:
                     val = field_map.get(field)
                     if pd.isna(val):
-                        # Пробуем подставить значение из поля без trade
-                        alt_field = field.replace(" trade <", " <")
-                        alt_val = aggregated_preply.get(alt_field) if aggregated_preply else None
-                        if pd.isna(alt_val):
-                            missing_fields.append(field)
-                        else:
-                            # Подставляем значение из альтернативного поля, если нужно
-                            field_map[field] = alt_val
+                        missing_fields.append(field)
 
                 if missing_fields:
                     comments_rutdf.add("Отсутствуют данные в полях: " + ", ".join(missing_fields))
-                    marker_rutdf = "Не идет в расчет"
+                    set_marker_rutdf("Не идет в расчет")
                     criteria_rutdf.add("3.2")
 
-                # Подгружаем нужные значения
+                # Условие 1–2: Проверка просрочки и задолженности
                 loan_indicator = field_map.get("loanIndicator")
-                closedDt = field_map.get("Плановая дата закрытия trade <closeDt>")
-                if isinstance(closedDt, str):
-                    try:
-                        closedDt = pd.to_datetime(closedDt)
-                    except:
-                        closedDt = None
-
                 pastdue_amtPastDue = field_map.get("Сумма просроченной задолжности -pastdueArrear <amtPastDue>")
                 due_amtOutstanding = field_map.get("Сумма задолжности -dueArrear <amtOutstanding>")
-                
+
                 def is_zero_or_empty(val):
                     try:
                         return pd.isna(val) or float(val) == 0.0
                     except:
                         return True
-                    
-                # Условие 1: loan_indicator = null (активный)
-                if pd.isna(loan_indicator):
+
+                if pd.isna(loan_indicator):  # Активный договор
                     if not is_zero_or_empty(pastdue_amtPastDue):
-                        marker_rutdf = "Не идет в расчет"
-                        comments_rutdf.add("PastdueArrear.amtPastDue ≠ 0, есть просроченная задолженность")
-                        criteria_rutdf.add("2.2")
+                        comments_rutdf.add("Есть просроченная задолженность, идет в расчет")
+                        set_marker_rutdf("Идет в расчет")
+                        criteria_rutdf.add("1.2")
+                    elif not is_zero_or_empty(due_amtOutstanding):
+                        comments_rutdf.add("Нет просрочки, но есть задолженность, идет в расчет")
+                        set_marker_rutdf("Идет в расчет")
+                        criteria_rutdf.add("1.2")
                     else:
-                        
-                        if not is_zero_or_empty(due_amtOutstanding):
-                            marker_rutdf = "Не идет в расчет"
-                            comments_rutdf.add("DueArrear.amtOutstanding ≠ 0, есть остаток задолженности")
-                            criteria_rutdf.add("2.2")
-                        else:
-                            
-                            criteria_rutdf.add("1.2")
-                
-                # Условие 4: loanIndicator есть, но не равен 2
-                if pd.notna(loan_indicator):
+                        comments_rutdf.add("Нет просрочки и задолженности")
+                        set_marker_rutdf("Не идет в расчет")
+                        criteria_rutdf.add("2.2")
+                else:
+                    comments_rutdf.add("Договор не активен (loanIndicator заполнен)")
+                    set_marker_rutdf("Не идет в расчет")
+                    criteria_rutdf.add("1.2")
+
+                    # Условие 4: loanIndicator ≠ 2
                     try:
                         if int(loan_indicator) != 2:
                             comments_rutdf.add("loanIndicator присутствует, но не равен 2 — договор закрыт без признака принудительного исполнения")
-                            marker_rutdf = "Не идет в расчет"
+                            set_marker_rutdf("Не идет в расчет")
                             criteria_rutdf.add("4.2")
                     except:
                         comments_rutdf.add("Ошибка при обработке loanIndicator")
-                        marker_rutdf = "Не идет в расчет"
+                        set_marker_rutdf("Не идет в расчет")
 
     return pd.Series([
         "; ".join(sorted(comments_simple)), marker_simple, ", ".join(sorted(criteria_simple)),
