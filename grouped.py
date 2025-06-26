@@ -34,7 +34,6 @@ def convert_types_credit_report(df):
         "Дата платежа <paymtDate>",
         "Дата расчета -dueArrear <calcDate>",
         "Дата расчета -pastdueArrear <calcDate>",
-        "Плановая дата закрытия trade <closeDt>",
         "Дата возникновения обязательства субъекта trade <commitDate>",
         "Дата открытия trade <openedDt>",
         "Дата расчета -accountAmt <amtDate>",
@@ -308,7 +307,24 @@ def evaluate_row_conditions(row, preply_df):
                 missing_fields = []
                 for field in required_fields:
                     val = field_map.get(field)
-                    if pd.isna(val):
+
+                    # Преобразуем значение в pd.Timestamp, если возможно
+                    try:
+                        val_ts = pd.to_datetime(val)
+                    except Exception:
+                        val_ts = None
+
+                    # Исключаем 9999-12-31 как допустимую дату
+                    if val_ts is not None and val_ts.date() == pd.Timestamp("9999-12-31").date():
+                        continue
+
+                    if pd.isna(val) or str(val).strip() in {"", "NaT"}:
+                        if field == "Дата открытия trade <openedDt>":
+                            alt_val = field_map.get("Дата возникновения обязательства субъекта trade <commitDate>")
+                            if pd.notna(alt_val) and str(alt_val).strip() not in {"", "NaT"}:
+                                field_map[field] = alt_val
+                                comments_rutdf.add("Дата открытия подставлена из commitDate")
+                                continue
                         missing_fields.append(field)
 
                 if missing_fields:
@@ -777,19 +793,19 @@ def make_monthly_summary_split(df: pd.DataFrame, writer: pd.ExcelWriter, df_simp
 
         # Вычисляем стартовый месяц — первый день предыдущего месяца от date_request
         start_month = (date_request - pd.DateOffset(months=1)).replace(day=1)
-        print(f"date_request: {date_request}, стартовый месяц: {start_month}")
+        # print(f"date_request: {date_request}, стартовый месяц: {start_month}")
 
         if start_month not in df_summary["Месяц_дата"].values:
-            print(f"Стартовый месяц {start_month} не найден в данных, используем минимальный месяц.")
+            # print(f"Стартовый месяц {start_month} не найден в данных, используем минимальный месяц.")
             start_month = df_summary["Месяц_дата"].min()
-        print(f"Финальный стартовый месяц: {start_month}")
+        # print(f"Финальный стартовый месяц: {start_month}")
 
         def find_actual_start(start_date, series):
             # Получаем индекс по дате
             try:
                 idx = series.index.get_loc(start_date)
             except KeyError:
-                print(f"⚠️ Дата {start_date} не найдена, используем первую позицию")
+                # print(f"⚠️ Дата {start_date} не найдена, используем первую позицию")
                 idx = 0
 
             # Ищем до 6 месяцев вперед первый с платежом != 0
@@ -812,8 +828,8 @@ def make_monthly_summary_split(df: pd.DataFrame, writer: pd.ExcelWriter, df_simp
         actual_start_idx_preply = find_actual_start(start_month, preply_series)
         actual_start_idx_preply2 = find_actual_start(start_month, preply2_series)
 
-        print(f"actual_start_idx_preply: {actual_start_idx_preply}")
-        print(f"actual_start_idx_preply2: {actual_start_idx_preply2}")
+        # print(f"actual_start_idx_preply: {actual_start_idx_preply}")
+        # print(f"actual_start_idx_preply2: {actual_start_idx_preply2}")
 
         # Для preply — берём 24 месяца вниз (в сторону уменьшения индекса)
         start_idx = actual_start_idx_preply
@@ -832,8 +848,8 @@ def make_monthly_summary_split(df: pd.DataFrame, writer: pd.ExcelWriter, df_simp
         count_preply = count_months_with_payment(slice_preply)
         count_preply2 = count_months_with_payment(slice_preply2)
 
-        print(f"count_preply: {count_preply}, count_preply2: {count_preply2}")
-        print(f"slice_preply.sum(): {slice_preply.sum()}, slice_preply2.sum(): {slice_preply2.sum()}")
+        # print(f"count_preply: {count_preply}, count_preply2: {count_preply2}")
+        # print(f"slice_preply.sum(): {slice_preply.sum()}, slice_preply2.sum(): {slice_preply2.sum()}")
 
         smd_preply = slice_preply.sum() / count_preply * 1.3 if count_preply > 0 else 0
         smd_preply2 = slice_preply2.sum() / count_preply2 * 1.3 if count_preply2 > 0 else 0
@@ -847,13 +863,13 @@ def make_monthly_summary_split(df: pd.DataFrame, writer: pd.ExcelWriter, df_simp
             "Комментарий": ""
         }
         df_summary = pd.concat([df_summary, pd.DataFrame([new_row])], ignore_index=True)
-        print(f"Количество месяцев с платежом preply: {(slice_preply != 0).sum()}")
-        print(f"Количество месяцев с платежом preply2: {(slice_preply2 != 0).sum()}")
-        print("Месяцы с платежами preply:")
-        print(slice_preply[slice_preply != 0])
+        # print(f"Количество месяцев с платежом preply: {(slice_preply != 0).sum()}")
+        # print(f"Количество месяцев с платежом preply2: {(slice_preply2 != 0).sum()}")
+        # print("Месяцы с платежами preply:")
+        # print(slice_preply[slice_preply != 0])
 
-        print("Месяцы с платежами preply2:")
-        print(slice_preply2[slice_preply2 != 0])
+        # print("Месяцы с платежами preply2:")
+        # print(slice_preply2[slice_preply2 != 0])
         
         # Сортируем по дате, кроме итоговой строки
         df_data = df_summary[df_summary["Месяц"] != "СМД по КИ"].copy()
